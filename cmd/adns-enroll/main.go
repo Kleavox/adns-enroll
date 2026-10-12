@@ -20,7 +20,17 @@ import (
 
 var version = "dev"
 
-const reconcileEvery = 10 * time.Minute
+const (
+	reconcileEvery = 10 * time.Minute
+	retryAfter     = 30 * time.Second
+)
+
+func pause(err error) time.Duration {
+	if err != nil {
+		return retryAfter
+	}
+	return reconcileEvery
+}
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "health" {
@@ -88,16 +98,15 @@ func run() error {
 }
 
 func reconcile(ctx context.Context, service *enroll.Service) {
-	tick := time.NewTicker(reconcileEvery)
-	defer tick.Stop()
 	for {
-		if err := service.Reconcile(ctx); err != nil && ctx.Err() == nil {
+		err := service.Reconcile(ctx)
+		if err != nil && ctx.Err() == nil {
 			log.Printf("reconcile: %v", err)
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-tick.C:
+		case <-time.After(pause(err)):
 		}
 	}
 }

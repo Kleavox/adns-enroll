@@ -2,38 +2,76 @@ name: Release
 
 on:
   push:
-    tags: ["v*.*.*"]
+    branches: [main]
+    paths:
+      - "VERSION"
+      - "go.mod"
+      - "cmd/**"
+      - "internal/**"
+      - "Dockerfile"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  image:
+  release:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "VERSION is '$version', which is not MAJOR.MINOR.PATCH." >&2
+            exit 1
+          fi
+          tag="v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${tag} already exists. Bump VERSION to cut a new release."
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.version.outputs.released == 'false'
         with:
           go-version-file: go.mod
           cache: false
+
       - name: Test
+        if: steps.version.outputs.released == 'false'
         run: |
           test -z "$(gofmt -l .)"
           go vet ./...
           go test ./...
+
       - name: Log in to GHCR
+        if: steps.version.outputs.released == 'false'
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      - name: Build and push
+
+      - name: Build and push the image
+        if: steps.version.outputs.released == 'false'
         env:
-          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
           OWNER: ${{ github.repository_owner }}
           REPOSITORY: ${{ github.repository }}
         run: |
@@ -41,8 +79,31 @@ jobs:
           docker buildx create --use
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
-            --build-arg "VERSION=${TAG#v}" \
-            --label "org.opencontainers.image.source=https://github.com/$REPOSITORY" \
-            --tag "$image:${TAG#v}" \
+            --build-arg "VERSION=${VERSION}" \
+            --label "org.opencontainers.image.source=https://github.com/${REPOSITORY}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --tag "$image:${VERSION}" \
             --tag "$image:latest" \
             --push .
+
+      - name: Tag the release
+        if: steps.version.outputs.released == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "adns-enroll $TAG"
+          git push origin "$TAG"
+
+      - name: Publish the release
+        if: steps.version.outputs.released == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          OWNER: ${{ github.repository_owner }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          gh release create "$TAG" --repo "$REPOSITORY" --title "adns-enroll ${VERSION}" --latest \
+            --notes "Image: ghcr.io/${OWNER,,}/adns-enroll:${VERSION}"

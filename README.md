@@ -104,5 +104,8 @@ go vet ./...
 go test ./...
 ```
 
-Releases: a `vX.Y.Z` tag builds `ghcr.io/kleavox/adns-enroll:X.Y.Z` and
-`:latest` for linux/amd64 and linux/arm64.
+Releases come from `VERSION`. A push to `main` that changes the code checks
+whether the tag `v<VERSION>` exists; if not, it tests, builds and pushes
+`ghcr.io/kleavox/adns-enroll:<VERSION>` and `:latest` for linux/amd64 and
+linux/arm64, then tags the commit and publishes a GitHub release. Without a
+bumped `VERSION` nothing is released.
