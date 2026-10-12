@@ -1,0 +1,307 @@
+:root {
+  --bg: #fbfbf9;
+  --card: #ffffff;
+  --text: #1c1d1f;
+  --muted: #62656b;
+  --line: #e2e3e0;
+  --accent: #2f6f4f;
+  --accent-text: #ffffff;
+  --danger: #b3261e;
+  --wait: #8a5a00;
+  --notice: #e8f2ec;
+  --problem: #fbe9e7;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141517;
+    --card: #1c1d20;
+    --text: #e8e8e6;
+    --muted: #a1a3a8;
+    --line: #2e3035;
+    --accent: #6fbf94;
+    --accent-text: #0e1a13;
+    --danger: #f2827a;
+    --wait: #e6b44c;
+    --notice: #1d2a22;
+    --problem: #2d1b19;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1.25rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  font-weight: 600;
+}
+
+.bar nav {
+  display: flex;
+  gap: 1rem;
+}
+
+.bar a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.bar a[aria-current="page"] {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.who {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+main {
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 1.25rem 1rem 3rem;
+}
+
+h1 {
+  font-size: 1.4rem;
+  margin: 0;
+}
+
+h2 {
+  font-size: 1.05rem;
+  margin: 1.75rem 0 0.5rem;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+button {
+  font: inherit;
+  padding: 0.4rem 0.8rem;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--text);
+  cursor: pointer;
+}
+
+button[type="submit"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+button.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #ffffff;
+}
+
+button:focus-visible,
+summary:focus-visible,
+input:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.item {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.what {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+  min-width: 0;
+}
+
+.name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.owner,
+time {
+  color: var(--muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.status {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.status-approved {
+  color: var(--accent);
+}
+
+.status-waiting {
+  color: var(--wait);
+}
+
+.address {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+
+.address code {
+  flex: 1;
+  min-width: 0;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.actions form {
+  margin: 0;
+}
+
+.menu {
+  position: relative;
+}
+
+.menu summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 0.2rem 0.6rem;
+  border-radius: 6px;
+  color: var(--muted);
+}
+
+.menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.menu-items {
+  position: absolute;
+  right: 0;
+  z-index: 1;
+  display: grid;
+  min-width: 11rem;
+  margin-top: 0.25rem;
+  padding: 0.25rem;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.menu-items button {
+  border: 0;
+  text-align: left;
+}
+
+dialog {
+  width: min(28rem, calc(100vw - 2rem));
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--text);
+  padding: 1rem 1.25rem;
+}
+
+dialog::backdrop {
+  background: rgb(0 0 0 / 40%);
+}
+
+dialog h2 {
+  margin-top: 0;
+}
+
+label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
+input {
+  width: 100%;
+  font: inherit;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.hint,
+.empty,
+.note {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.notice,
+.problem {
+  padding: 0.6rem 0.8rem;
+  border-radius: 6px;
+  margin: 0 0 1rem;
+}
+
+.notice {
+  background: var(--notice);
+}
+
+.problem {
+  background: var(--problem);
+  color: var(--danger);
+}
+
+.help ul {
+  padding-left: 1.2rem;
+}
