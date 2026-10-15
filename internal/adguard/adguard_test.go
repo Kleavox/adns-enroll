@@ -154,6 +154,25 @@ func TestAllowingTouchesOnlyTheGivenID(t *testing.T) {
 	}
 }
 
+func TestRemovingTheLastAllowedEntryLeavesAdGuardAnsweringNobody(t *testing.T) {
+	f := newFake()
+	f.access["allowed_clients"] = []any{"0123456789abcdef0123456789abcdef"}
+	api := f.server(t)
+	ctx := context.Background()
+	if err := api.Disallow(ctx, "0123456789abcdef0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.allowed(); !slices.Equal(got, []string{"192.0.2.1"}) {
+		t.Fatalf("an empty list lets everyone in; allowed %v", got)
+	}
+	if err := api.Allow(ctx, "fedcba9876543210fedcba9876543210"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.allowed(); !slices.Equal(got, []string{"fedcba9876543210fedcba9876543210"}) {
+		t.Fatalf("the placeholder stays after a real entry; allowed %v", got)
+	}
+}
+
 func TestDeletingAClientAndListingClients(t *testing.T) {
 	f := newFake()
 	api := f.server(t)

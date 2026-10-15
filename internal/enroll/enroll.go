@@ -5,12 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/Kleavox/adns-enroll/internal/adguard"
 	"github.com/Kleavox/adns-enroll/internal/store"
@@ -32,16 +30,16 @@ type Service struct {
 	Now   func() time.Time
 }
 
+type Person struct {
+	Sub   string
+	Email string
+	Name  string
+}
+
 var (
-	ErrNotFound = errors.New("there is no such device")
-	ErrState    = errors.New("the device is not in a state that allows this")
+	ErrNotFound = errors.New("there is no such account")
+	ErrState    = errors.New("the account is not in a state that allows this")
 )
-
-type Invalid string
-
-func (i Invalid) Error() string { return string(i) }
-
-const maxName = 40
 
 func random(size int) string {
 	buffer := make([]byte, size)
@@ -49,77 +47,163 @@ func random(size int) string {
 	return hex.EncodeToString(buffer)
 }
 
-func ClientName(device store.Device) string {
+func Email(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func clientNameFor(account store.Account) string {
+	who := account.Email
+	if who == "" {
+		who = account.Name
+	}
+	return who + " · " + account.ID
+}
+
+func legacyName(device store.Device) string {
 	return device.Name + " · " + device.Owner + " · " + device.ID
 }
 
-func Owner(email string) string {
-	return strings.ToLower(strings.TrimSpace(email))
-}
-
-func cleanName(name string) (string, error) {
-	name = strings.TrimSpace(name)
-	switch {
-	case name == "":
-		return "", Invalid("Give the device a name, such as Phone.")
-	case utf8.RuneCountInString(name) > maxName:
-		return "", Invalid(fmt.Sprintf("A device name is at most %d characters.", maxName))
-	case strings.ContainsFunc(name, unicode.IsControl):
-		return "", Invalid("A device name is one line of text.")
-	}
-	return name, nil
-}
-
-func (s *Service) Request(owner, name string) (store.Device, error) {
-	owner = Owner(owner)
-	if owner == "" {
-		return store.Device{}, Invalid("A request needs a signed-in person.")
-	}
-	name, err := cleanName(name)
-	if err != nil {
-		return store.Device{}, err
-	}
-	device := store.Device{ID: random(8), Owner: owner, Name: name, Status: store.Waiting, Created: s.Now()}
-	err = s.Store.Update(func(state *store.State) error {
-		state.Devices = append(state.Devices, device)
-		return nil
-	})
-	return device, err
-}
-
-func (s *Service) device(id string) (store.Device, error) {
-	state, err := s.Store.Read()
-	if err != nil {
-		return store.Device{}, err
-	}
-	for _, device := range state.Devices {
-		if device.ID == id {
-			return device, nil
-		}
-	}
-	return store.Device{}, ErrNotFound
-}
-
-func (s *Service) change(id string, edit func(*store.State, int) error) error {
+func (s *Service) change(id string, edit func(*store.State, *store.Account) error) error {
 	return s.Store.Update(func(state *store.State) error {
-		index := slices.IndexFunc(state.Devices, func(device store.Device) bool { return device.ID == id })
+		index := slices.IndexFunc(state.Accounts, func(account store.Account) bool { return account.ID == id })
 		if index < 0 {
 			return ErrNotFound
 		}
-		return edit(state, index)
+		return edit(state, &state.Accounts[index])
 	})
 }
 
+func (s *Service) account(id string) (store.Account, error) {
+	state, err := s.Store.Read()
+	if err != nil {
+		return store.Account{}, err
+	}
+	for _, account := range state.Accounts {
+		if account.ID == id {
+			return account, nil
+		}
+	}
+	return store.Account{}, ErrNotFound
+}
+
+func remember(state *store.State, name string) {
+	if !slices.Contains(state.Made, name) {
+		state.Made = append(state.Made, name)
+	}
+}
+
+func retire(state *store.State, ids []string) {
+	for _, id := range ids {
+		if !slices.Contains(state.Retired, id) {
+			state.Retired = append(state.Retired, id)
+		}
+	}
+}
+
+func (s *Service) Migrate() error {
+	return s.Store.Update(func(state *store.State) error {
+		if len(state.Devices) == 0 {
+			return nil
+		}
+		owners := map[string][]store.Device{}
+		for _, device := range state.Devices {
+			if device.Status == string(store.Approved) && device.ClientID != "" {
+				owners[device.Owner] = append(owners[device.Owner], device)
+				remember(state, legacyName(device))
+			}
+		}
+		for _, owner := range slices.Sorted(maps.Keys(owners)) {
+			devices := owners[owner]
+			slices.SortFunc(devices, func(a, b store.Device) int { return b.Created.Compare(a.Created) })
+			account := store.Account{
+				ID:         random(8),
+				Email:      Email(owner),
+				Status:     store.Approved,
+				ClientName: legacyName(devices[0]),
+				Requested:  devices[len(devices)-1].Created,
+				Decided:    devices[0].Decided,
+			}
+			for _, device := range devices {
+				account.ClientIDs = append(account.ClientIDs, device.ClientID)
+			}
+			state.Accounts = append(state.Accounts, account)
+		}
+		state.Devices = nil
+		return nil
+	})
+}
+
+func (s *Service) restore(ctx context.Context, account store.Account) error {
+	if err := s.DNS.Add(ctx, account.ClientName, account.ClientIDs[0]); err != nil {
+		if s.DNS.SetIDs(ctx, account.ClientName, account.ClientIDs) != nil {
+			return err
+		}
+	}
+	if len(account.ClientIDs) > 1 {
+		if err := s.DNS.SetIDs(ctx, account.ClientName, account.ClientIDs); err != nil {
+			return err
+		}
+	}
+	for _, id := range account.ClientIDs {
+		if err := s.DNS.Allow(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) Seen(ctx context.Context, person Person) (store.Account, error) {
+	if strings.TrimSpace(person.Sub) == "" {
+		return store.Account{}, errors.New("a person needs a subject")
+	}
+	var seen store.Account
+	err := s.Store.Update(func(state *store.State) error {
+		index := slices.IndexFunc(state.Accounts, func(account store.Account) bool { return account.Sub == person.Sub })
+		if index < 0 {
+			state.Accounts = append(state.Accounts, store.Account{
+				ID:        random(8),
+				Sub:       person.Sub,
+				Email:     Email(person.Email),
+				Name:      strings.TrimSpace(person.Name),
+				Status:    store.Waiting,
+				Requested: s.Now(),
+			})
+			index = len(state.Accounts) - 1
+		}
+		account := &state.Accounts[index]
+		if email := Email(person.Email); email != "" {
+			account.Email = email
+		}
+		if name := strings.TrimSpace(person.Name); name != "" {
+			account.Name = name
+		}
+		seen = *account
+		return nil
+	})
+	if err != nil || seen.Status != store.Ended {
+		return seen, err
+	}
+	if err := s.restore(ctx, seen); err != nil {
+		return seen, err
+	}
+	err = s.change(seen.ID, func(_ *store.State, account *store.Account) error {
+		account.Status = store.Approved
+		seen = *account
+		return nil
+	})
+	return seen, err
+}
+
 func (s *Service) Approve(ctx context.Context, id string) error {
-	device, err := s.device(id)
+	account, err := s.account(id)
 	if err != nil {
 		return err
 	}
-	if device.Status != store.Waiting {
+	if account.Status != store.Waiting && account.Status != store.Denied {
 		return ErrState
 	}
 	clientID := random(16)
-	name := ClientName(device)
+	name := clientNameFor(account)
 	if err := s.DNS.Add(ctx, name, clientID); err != nil {
 		if s.DNS.SetIDs(ctx, name, []string{clientID}) != nil {
 			return err
@@ -129,13 +213,15 @@ func (s *Service) Approve(ctx context.Context, id string) error {
 		s.DNS.Delete(ctx, name)
 		return err
 	}
-	err = s.change(id, func(state *store.State, index int) error {
-		if state.Devices[index].Status != store.Waiting {
+	err = s.change(id, func(state *store.State, account *store.Account) error {
+		if account.Status != store.Waiting && account.Status != store.Denied {
 			return ErrState
 		}
-		state.Devices[index].Status = store.Approved
-		state.Devices[index].ClientID = clientID
-		state.Devices[index].Decided = s.Now()
+		account.Status = store.Approved
+		account.ClientIDs = []string{clientID}
+		account.ClientName = name
+		account.Decided = s.Now()
+		remember(state, name)
 		return nil
 	})
 	if err != nil {
@@ -146,86 +232,130 @@ func (s *Service) Approve(ctx context.Context, id string) error {
 }
 
 func (s *Service) Reject(id string) error {
-	return s.change(id, func(state *store.State, index int) error {
-		if state.Devices[index].Status != store.Waiting {
+	return s.change(id, func(_ *store.State, account *store.Account) error {
+		if account.Status != store.Waiting {
 			return ErrState
 		}
-		state.Devices[index].Status = store.Rejected
-		state.Devices[index].Decided = s.Now()
+		account.Status = store.Denied
+		account.Decided = s.Now()
 		return nil
 	})
 }
 
 func (s *Service) Revoke(ctx context.Context, id string) error {
-	device, err := s.device(id)
+	account, err := s.account(id)
 	if err != nil {
 		return err
 	}
-	return s.drop(ctx, device)
-}
-
-func (s *Service) Remove(ctx context.Context, owner, id string) error {
-	device, err := s.device(id)
-	if err != nil {
-		return err
+	if account.Status != store.Approved && account.Status != store.Ended {
+		return ErrState
 	}
-	if device.Owner != Owner(owner) {
-		return ErrNotFound
-	}
-	return s.drop(ctx, device)
-}
-
-func (s *Service) drop(ctx context.Context, device store.Device) error {
-	if device.ClientID != "" {
-		if err := s.DNS.Disallow(ctx, device.ClientID); err != nil {
+	if len(account.ClientIDs) > 0 {
+		if err := s.DNS.Disallow(ctx, account.ClientIDs...); err != nil {
 			return err
 		}
-		s.DNS.Delete(ctx, ClientName(device))
+		s.DNS.Delete(ctx, account.ClientName)
 	}
-	return s.change(device.ID, func(state *store.State, index int) error {
-		state.Devices = slices.Delete(state.Devices, index, index+1)
-		if device.ClientID != "" && !slices.Contains(state.Retired, device.ClientID) {
-			state.Retired = append(state.Retired, device.ClientID)
-		}
+	return s.change(id, func(state *store.State, account *store.Account) error {
+		retire(state, account.ClientIDs)
+		account.Status = store.Denied
+		account.ClientIDs = nil
+		account.Decided = s.Now()
 		return nil
 	})
 }
 
-func (s *Service) Renew(ctx context.Context, owner, id string) error {
-	device, err := s.device(id)
+func (s *Service) Renew(ctx context.Context, id string) error {
+	account, err := s.account(id)
 	if err != nil {
 		return err
 	}
-	if device.Owner != Owner(owner) {
-		return ErrNotFound
-	}
-	if device.Status != store.Approved {
+	if account.Status != store.Approved || len(account.ClientIDs) == 0 {
 		return ErrState
 	}
-	old, fresh, name := device.ClientID, random(16), ClientName(device)
-	if err := s.DNS.SetIDs(ctx, name, []string{old, fresh}); err != nil {
+	old, fresh, name := account.ClientIDs, random(16), account.ClientName
+	if err := s.DNS.SetIDs(ctx, name, append(slices.Clone(old), fresh)); err != nil {
 		return err
 	}
 	if err := s.DNS.Allow(ctx, fresh); err != nil {
-		s.DNS.SetIDs(ctx, name, []string{old})
+		s.DNS.SetIDs(ctx, name, old)
 		return err
 	}
-	err = s.change(id, func(state *store.State, index int) error {
-		if state.Devices[index].ClientID != old {
+	err = s.change(id, func(state *store.State, account *store.Account) error {
+		if !slices.Equal(account.ClientIDs, old) {
 			return ErrState
 		}
-		state.Devices[index].ClientID = fresh
-		state.Retired = append(state.Retired, old)
+		account.ClientIDs = []string{fresh}
+		retire(state, old)
 		return nil
 	})
 	if err != nil {
 		s.DNS.Disallow(ctx, fresh)
-		s.DNS.SetIDs(ctx, name, []string{old})
+		s.DNS.SetIDs(ctx, name, old)
 		return err
 	}
 	s.DNS.SetIDs(ctx, name, []string{fresh})
-	s.DNS.Disallow(ctx, old)
+	s.DNS.Disallow(ctx, old...)
 	return nil
+}
+
+func (s *Service) Link(id, legacyID string) error {
+	return s.Store.Update(func(state *store.State) error {
+		index := slices.IndexFunc(state.Accounts, func(account store.Account) bool { return account.ID == id })
+		old := slices.IndexFunc(state.Accounts, func(account store.Account) bool {
+			return account.ID == legacyID && account.Sub == "" && account.Status == store.Approved
+		})
+		if index < 0 || old < 0 {
+			return ErrNotFound
+		}
+		account, legacy := &state.Accounts[index], state.Accounts[old]
+		if account.Sub == "" || account.Status != store.Waiting || account.Email != legacy.Email {
+			return ErrState
+		}
+		account.Status = store.Approved
+		account.ClientIDs = legacy.ClientIDs
+		account.ClientName = legacy.ClientName
+		account.Decided = s.Now()
+		state.Accounts = slices.Delete(state.Accounts, old, old+1)
+		return nil
+	})
+}
+
+func (s *Service) Subjects() ([]string, error) {
+	state, err := s.Store.Read()
+	if err != nil {
+		return nil, err
+	}
+	var subjects []string
+	for _, account := range state.Accounts {
+		if account.Status == store.Approved && account.Sub != "" {
+			subjects = append(subjects, account.Sub)
+		}
+	}
+	return subjects, nil
+}
+
+func (s *Service) EndMissing(ctx context.Context, asked, live []string) error {
+	state, err := s.Store.Read()
+	if err != nil {
+		return err
+	}
+	var problems []error
+	for _, account := range state.Accounts {
+		if account.Status != store.Approved || account.Sub == "" || !slices.Contains(asked, account.Sub) || slices.Contains(live, account.Sub) {
+			continue
+		}
+		if err := s.DNS.Disallow(ctx, account.ClientIDs...); err != nil {
+			problems = append(problems, err)
+			continue
+		}
+		s.DNS.Delete(ctx, account.ClientName)
+		problems = append(problems, s.change(account.ID, func(_ *store.State, account *store.Account) error {
+			account.Status = store.Ended
+			return nil
+		}))
+	}
+	return errors.Join(problems...)
 }
 
 func (s *Service) Reconcile(ctx context.Context) error {
@@ -241,38 +371,51 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	byName := map[string][]string{}
-	for _, client := range clients {
-		byName[client.Name] = client.IDs
+	desired := map[string][]string{}
+	var wanted, dropped []string
+	for _, account := range state.Accounts {
+		if account.Status == store.Approved && account.ClientName != "" && len(account.ClientIDs) > 0 {
+			desired[account.ClientName] = account.ClientIDs
+			wanted = append(wanted, account.ClientIDs...)
+		} else {
+			dropped = append(dropped, account.ClientIDs...)
+		}
 	}
+	dropped = append(dropped, state.Retired...)
 	var problems []error
-	for _, device := range state.Devices {
-		if device.Status != store.Approved || device.ClientID == "" {
+	present := map[string][]string{}
+	for _, client := range clients {
+		if _, keep := desired[client.Name]; !keep && slices.Contains(state.Made, client.Name) {
+			problems = append(problems, s.DNS.Delete(ctx, client.Name))
 			continue
 		}
-		name, want := ClientName(device), []string{device.ClientID}
-		if ids, found := byName[name]; !found {
-			problems = append(problems, s.DNS.Add(ctx, name, device.ClientID))
-		} else if !slices.Equal(ids, want) {
-			problems = append(problems, s.DNS.SetIDs(ctx, name, want))
-		}
-		if !slices.Contains(allowed, device.ClientID) {
-			problems = append(problems, s.DNS.Allow(ctx, device.ClientID))
-		}
+		present[client.Name] = client.IDs
 	}
-	retired := func(id string) bool { return slices.Contains(state.Retired, id) }
-	if stale := slices.DeleteFunc(slices.Clone(allowed), func(id string) bool { return !retired(id) }); len(stale) > 0 {
-		problems = append(problems, s.DNS.Disallow(ctx, stale...))
-	}
-	for _, client := range clients {
-		kept := slices.DeleteFunc(slices.Clone(client.IDs), retired)
+	for _, name := range slices.Sorted(maps.Keys(desired)) {
+		ids := desired[name]
+		current, found := present[name]
 		switch {
-		case len(kept) == len(client.IDs):
-		case len(kept) == 0:
-			problems = append(problems, s.DNS.Delete(ctx, client.Name))
-		default:
-			problems = append(problems, s.DNS.SetIDs(ctx, client.Name, kept))
+		case !found:
+			if err := s.DNS.Add(ctx, name, ids[0]); err != nil {
+				problems = append(problems, err)
+				continue
+			}
+			if len(ids) > 1 {
+				problems = append(problems, s.DNS.SetIDs(ctx, name, ids))
+			}
+		case !slices.Equal(current, ids):
+			problems = append(problems, s.DNS.SetIDs(ctx, name, ids))
 		}
+	}
+	for _, id := range wanted {
+		if !slices.Contains(allowed, id) {
+			problems = append(problems, s.DNS.Allow(ctx, id))
+		}
+	}
+	if stale := slices.DeleteFunc(slices.Clone(allowed), func(id string) bool {
+		return !slices.Contains(dropped, id) || slices.Contains(wanted, id)
+	}); len(stale) > 0 {
+		problems = append(problems, s.DNS.Disallow(ctx, stale...))
 	}
 	return errors.Join(problems...)
 }

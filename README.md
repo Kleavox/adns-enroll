@@ -5,17 +5,27 @@ that gives the people you approve their own DNS-over-HTTPS address, such as
 `https://dns.example.com/dns-query/3f9c…`, and a page that shows it with a Copy
 button, so nobody has to remember a long ClientID.
 
-- A person signs in, asks for a device ("Phone") and waits.
+- A person signs in with [Pawl](https://github.com/Kleavox/Pawl). The first
+  sign-in is a request: they are thanked and wait, and nothing more is shown.
 - An admin approves or rejects. On approval the app makes a random 128-bit
-  ClientID, adds it to AdGuard as a client and to **Allowed clients**.
-- The person sees the address, can make a **New address** (the old one stops at
-  once) or **Remove** the device. An admin can **Revoke** any device.
+  ClientID, adds it to AdGuard as a client and to **Allowed clients**. One
+  address per account; every device of theirs uses it.
+- Only the admin makes a **New address** (the old one stops at once) or
+  **Revokes** an account.
 - Every 10 minutes, and on start, the app checks AdGuard against its own list
-  and repairs what drifted.
+  and repairs what drifted. Every 6 hours, and on start, it asks Pawl which
+  approved accounts still exist; an account Pawl no longer knows (deleted, or
+  disconnected from this app) stops working, and comes back as it was when
+  that person signs in again. When Pawl cannot be asked, nothing changes.
 
 It only touches what it made: entries in Allowed clients and clients it did
 not create are never changed. AdGuard's API is called on the private network
 only; it never needs to face the internet.
+
+AdGuard reads an empty Allowed clients list as "everyone". When removing a
+device would leave the list empty, the app puts `192.0.2.1` there instead, a
+documentation address no client can have (RFC 5737), so AdGuard keeps
+answering nobody. The next approved device takes its place.
 
 ## How it runs
 
@@ -23,10 +33,17 @@ One container, Go standard library only, pages rendered on the server. Data
 is one JSON file in `/data`. The container runs as a non-root user and works
 with a read-only root filesystem.
 
-Sign-in comes from the front door. Today that is Cloudflare Access: the app
-verifies the `Cf-Access-Jwt-Assertion` token itself (signature, issuer,
-audience, expiry) against your team's keys and answers 401 without a valid
-one.
+Sign-in is OpenID Connect with Pawl (authorization code, PKCE, a client
+secret). The app checks Pawl's ES256 ID token itself and keeps its own
+12-hour session cookie. An account is Pawl's `sub` for this app; the email is
+only shown. Put nothing in front of the app's Web address: no Cloudflare
+Access.
+
+The app also answers Pawl's card, `GET /.well-known/pawl/card`, so the cabinet
+shows the request's state: waiting, the DNS address and ClientID with Copy,
+or no access. **Detail** opens this app. Pawl only relays what the app writes.
+The card holds at most 70 characters per value; an address longer than that
+(a `DOH_HOST` over 19 characters) is left off the card and shown on the page.
 
 ## Configuration
 
@@ -35,15 +52,37 @@ one.
 | `ADGUARD_URL` | AdGuard Home base URL, e.g. `http://host.docker.internal:3000` |
 | `ADGUARD_USERNAME`, `ADGUARD_PASSWORD` | an AdGuard user for this app |
 | `DOH_HOST` | host shown in the address, e.g. `dns.example.com` |
-| `ADMIN_EMAILS` | comma-separated admin emails |
-| `ACCESS_TEAM` | Cloudflare Access team domain, e.g. `yourteam.cloudflareaccess.com` |
-| `ACCESS_AUD` | the AUD tag of the Access application in front of this app |
+| `PAWL_ISSUER` | Pawl's address, e.g. `https://paw.example.com` |
+| `PAWL_CLIENT_ID`, `PAWL_CLIENT_SECRET` | from registering this app in Pawl |
+| `PUBLIC_ORIGIN` | this app's own address, e.g. `https://enroll.example.com` |
+| `ADMIN_SUBJECTS` | comma-separated Pawl subjects of the admins |
 | `DATA_DIR` | data directory, default `/data` |
 | `LISTEN` | listen address, default `:8080` |
 
-Without `ACCESS_TEAM` or `ACCESS_AUD` the app starts, answers `/healthz`, and
-every page says which of the two is missing. That lets you deploy first and
-copy the AUD once the Access application exists.
+Without one of the four Pawl settings the app starts, answers `/healthz`, and
+every page says which one is missing. Without `ADMIN_SUBJECTS` nobody is admin,
+and the page shows the signed-in person their own subject to put there.
+Sessions are sealed with a key derived from the client secret, so a new secret
+signs everyone out.
+
+`ADMIN_EMAILS`, `ACCESS_TEAM` and `ACCESS_AUD` are no longer read; the log says
+so when they are still set.
+
+## Registering in Pawl
+
+In `paw.` sign in as the admin, then **Account → Registered apps → New app**:
+the app's title, its address (`PUBLIC_ORIGIN`), who may see it, the return
+address `PUBLIC_ORIGIN/auth/callback`, and **Shows a card on the cabinet**.
+Pawl shows the ClientID and the secret once; put them in the settings above.
+
+## From devices to accounts
+
+Before 0.1.2 the app kept devices, signed in through Access. On start it turns
+them into one account per owner email, approved, keeping their ClientIDs, so
+no address stops working. That account has no Pawl subject yet. When the owner
+of that email signs in with Pawl, their request shows **Link to the old
+account** next to Approve; linking gives them the addresses they had. The app
+never links on its own: an email match is the admin's call.
 
 ## AdGuard user
 
@@ -70,7 +109,7 @@ users:
 ```yaml
 services:
   enroll:
-    image: ghcr.io/kleavox/adns-enroll:0.1.0
+    image: ghcr.io/kleavox/adns-enroll:0.1.2
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
@@ -82,9 +121,11 @@ services:
       ADGUARD_USERNAME: enroll
       ADGUARD_PASSWORD: ${ADGUARD_PASSWORD}
       DOH_HOST: dns.example.com
-      ADMIN_EMAILS: ${ADMIN_EMAILS}
-      ACCESS_TEAM: yourteam.cloudflareaccess.com
-      ACCESS_AUD: ${ACCESS_AUD}
+      PAWL_ISSUER: https://paw.example.com
+      PAWL_CLIENT_ID: ${PAWL_CLIENT_ID}
+      PAWL_CLIENT_SECRET: ${PAWL_CLIENT_SECRET}
+      PUBLIC_ORIGIN: https://enroll.example.com
+      ADMIN_SUBJECTS: ${ADMIN_SUBJECTS}
     volumes:
       - data:/data
 
@@ -92,7 +133,8 @@ volumes:
   data:
 ```
 
-The app must reach AdGuard's web port on the host and nothing else. With
+The app must reach AdGuard's web port on the host and Pawl's public address,
+and nothing else. With
 [Krynodes](https://github.com/Kleavox/Krynodes) that is a Contained stack with
 **Reach this server on** `3000/tcp`, published through its **Web address**.
 

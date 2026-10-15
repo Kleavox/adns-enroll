@@ -53,19 +53,13 @@ body {
   font-weight: 600;
 }
 
-.bar nav {
-  display: flex;
-  gap: 1rem;
+.signout {
+  margin: 0;
 }
 
-.bar a {
-  color: var(--muted);
-  text-decoration: none;
-}
-
-.bar a[aria-current="page"] {
-  color: var(--text);
-  font-weight: 600;
+.signout button {
+  padding: 0.25rem 0.6rem;
+  font-size: 13px;
 }
 
 .who {

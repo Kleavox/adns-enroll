@@ -1,11 +1,9 @@
 package main
 
 import (
-	"net/http"
+	"crypto/hmac"
+	"crypto/sha256"
 	"strings"
-
-	"github.com/Kleavox/adns-enroll/internal/access"
-	"github.com/Kleavox/adns-enroll/internal/web"
 )
 
 type config struct {
@@ -14,10 +12,13 @@ type config struct {
 	AdGuardPassword string
 	DoHHost         string
 	Admins          []string
-	AccessTeam      string
-	AccessAUD       string
+	Issuer          string
+	ClientID        string
+	ClientSecret    string
+	Origin          string
 	DataDir         string
 	Listen          string
+	Retired         []string
 }
 
 func load(getenv func(string) string) (config, []string) {
@@ -27,14 +28,21 @@ func load(getenv func(string) string) (config, []string) {
 		AdGuardUser:     value("ADGUARD_USERNAME"),
 		AdGuardPassword: getenv("ADGUARD_PASSWORD"),
 		DoHHost:         value("DOH_HOST"),
-		AccessTeam:      value("ACCESS_TEAM"),
-		AccessAUD:       value("ACCESS_AUD"),
+		Issuer:          strings.TrimSuffix(value("PAWL_ISSUER"), "/"),
+		ClientID:        value("PAWL_CLIENT_ID"),
+		ClientSecret:    getenv("PAWL_CLIENT_SECRET"),
+		Origin:          strings.TrimSuffix(value("PUBLIC_ORIGIN"), "/"),
 		DataDir:         value("DATA_DIR"),
 		Listen:          value("LISTEN"),
 	}
-	for admin := range strings.SplitSeq(getenv("ADMIN_EMAILS"), ",") {
-		if admin = strings.ToLower(strings.TrimSpace(admin)); admin != "" {
+	for admin := range strings.SplitSeq(getenv("ADMIN_SUBJECTS"), ",") {
+		if admin = strings.TrimSpace(admin); admin != "" {
 			c.Admins = append(c.Admins, admin)
+		}
+	}
+	for _, old := range []string{"ADMIN_EMAILS", "ACCESS_TEAM", "ACCESS_AUD"} {
+		if value(old) != "" {
+			c.Retired = append(c.Retired, old)
 		}
 	}
 	if c.DataDir == "" {
@@ -52,7 +60,6 @@ func load(getenv func(string) string) (config, []string) {
 		{"ADGUARD_USERNAME", c.AdGuardUser != ""},
 		{"ADGUARD_PASSWORD", c.AdGuardPassword != ""},
 		{"DOH_HOST", c.DoHHost != ""},
-		{"ADMIN_EMAILS", len(c.Admins) > 0},
 	} {
 		if !required.set {
 			missing = append(missing, required.name)
@@ -61,18 +68,25 @@ func load(getenv func(string) string) (config, []string) {
 	return c, missing
 }
 
-type notSetUp string
-
-func (n notSetUp) Email(*http.Request) (string, error) {
-	return "", web.Unready("Sign-in is not set up yet: " + string(n) + " is missing.")
+func (c config) signInMissing() string {
+	for _, setting := range []struct {
+		name string
+		set  bool
+	}{
+		{"PAWL_ISSUER", c.Issuer != ""},
+		{"PAWL_CLIENT_ID", c.ClientID != ""},
+		{"PAWL_CLIENT_SECRET", c.ClientSecret != ""},
+		{"PUBLIC_ORIGIN", c.Origin != ""},
+	} {
+		if !setting.set {
+			return setting.name
+		}
+	}
+	return ""
 }
 
-func (c config) identity() web.Identity {
-	switch {
-	case c.AccessTeam == "":
-		return notSetUp("ACCESS_TEAM")
-	case c.AccessAUD == "":
-		return notSetUp("ACCESS_AUD")
-	}
-	return access.New(c.AccessTeam, c.AccessAUD)
+func (c config) sessionKey() []byte {
+	signer := hmac.New(sha256.New, []byte(c.ClientSecret))
+	signer.Write([]byte("adns-enroll session"))
+	return signer.Sum(nil)
 }

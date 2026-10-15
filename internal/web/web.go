@@ -1,7 +1,9 @@
 package web
 
 import (
+	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"html/template"
 	"io/fs"
@@ -10,8 +12,10 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Kleavox/adns-enroll/internal/enroll"
+	"github.com/Kleavox/adns-enroll/internal/pawl"
 	"github.com/Kleavox/adns-enroll/internal/store"
 )
 
@@ -25,47 +29,58 @@ var pages = template.Must(template.ParseFS(templates, "templates/*.html"))
 
 const policy = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
 
-type Identity interface {
-	Email(r *http.Request) (string, error)
+type Pawl interface {
+	AuthorizeURL(ctx context.Context, state, nonce, challenge string) (string, error)
+	Exchange(ctx context.Context, code, verifier, nonce string) (pawl.Person, error)
+	Card(ctx context.Context, token string) (pawl.Person, error)
 }
 
 type Server struct {
-	Service  *enroll.Service
-	Identity Identity
-	Admins   []string
-	DoHHost  string
-	Log      func(format string, args ...any)
+	Service *enroll.Service
+	Pawl    Pawl
+	Admins  []string
+	DoHHost string
+	Origin  string
+	Key     []byte
+	Missing string
+	Log     func(format string, args ...any)
+	Now     func() time.Time
 }
 
 var notices = map[string]string{
-	"requested": "Your request is waiting for approval.",
-	"renewed":   "The device has a new address. Put it in place of the old one; the old one has stopped working.",
-	"removed":   "The device is removed and its address has stopped working.",
-	"approved":  "Approved. The address works now.",
-	"rejected":  "Rejected.",
-	"revoked":   "Revoked. The address has stopped working.",
+	"approved": "Approved. Their address works now.",
+	"rejected": "Rejected.",
+	"revoked":  "Revoked. Their address has stopped working.",
+	"renewed":  "They have a new address; the old one has stopped working. Let them know.",
+	"linked":   "Linked. They keep the addresses they had before.",
 }
 
-type view struct {
-	ID      string
-	Name    string
-	Owner   string
-	Status  string
-	Label   string
-	URL     string
-	Created time.Time
+type row struct {
+	ID        string
+	Email     string
+	Name      string
+	Status    string
+	Label     string
+	Requested time.Time
+	Legacy    string
 }
 
 type page struct {
+	Template string
 	Email    string
 	Admin    bool
-	Section  string
-	Devices  []view
-	Waiting  []view
-	Decided  []view
+	Status   string
+	Address  string
+	ClientID string
+	Sub      string
+	NoAdmin  bool
 	Notice   string
 	Problem  string
-	Template string
+	Heading  string
+	Message  string
+	Waiting  []row
+	Accounts []row
+	Denied   []row
 }
 
 func (s *Server) Handler() http.Handler {
@@ -76,14 +91,14 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Write([]byte("ok"))
 	})
-	mux.HandleFunc("GET /{$}", s.person(s.devices))
-	mux.HandleFunc("POST /devices", s.change(s.request))
-	mux.HandleFunc("POST /devices/{id}/remove", s.change(s.remove))
-	mux.HandleFunc("POST /devices/{id}/renew", s.change(s.renew))
-	mux.HandleFunc("GET /admin", s.person(s.admin(s.requests)))
-	mux.HandleFunc("POST /admin/devices/{id}/approve", s.change(s.admin(s.approve)))
-	mux.HandleFunc("POST /admin/devices/{id}/reject", s.change(s.admin(s.reject)))
-	mux.HandleFunc("POST /admin/devices/{id}/revoke", s.change(s.admin(s.revoke)))
+	mux.HandleFunc("GET /auth/signin", s.ready(s.signin))
+	mux.HandleFunc("GET /auth/callback", s.ready(s.callback))
+	mux.HandleFunc("POST /auth/signout", s.ready(s.signout))
+	mux.HandleFunc("GET /.well-known/pawl/card", s.ready(s.card))
+	mux.HandleFunc("GET /{$}", s.ready(s.person(s.home)))
+	for _, action := range []string{"approve", "reject", "revoke", "renew", "link"} {
+		mux.HandleFunc("POST /admin/accounts/{id}/"+action, s.ready(s.person(s.change(s.admin(s.decide(action))))))
+	}
 	return headers(mux)
 }
 
@@ -101,85 +116,62 @@ func headers(next http.Handler) http.Handler {
 	})
 }
 
-type Unready string
+func (s *Server) ready(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.Missing != "" {
+			http.Error(w, "Sign-in is not set up yet: "+s.Missing+" is missing.", http.StatusServiceUnavailable)
+			return
+		}
+		next(w, r)
+	}
+}
 
-func (u Unready) Error() string { return string(u) }
-
-type handler func(w http.ResponseWriter, r *http.Request, email string)
+type handler func(w http.ResponseWriter, r *http.Request, who sealed)
 
 func (s *Server) person(next handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		email, err := s.Identity.Email(r)
-		var unready Unready
-		if errors.As(err, &unready) {
-			http.Error(w, unready.Error(), http.StatusServiceUnavailable)
+		who, found := s.read(r, sessionCookie, useSession)
+		if !found {
+			http.Redirect(w, r, "/auth/signin", http.StatusFound)
 			return
 		}
-		if err != nil || email == "" {
-			http.Error(w, "Sign in first.", http.StatusUnauthorized)
-			return
-		}
-		next(w, r, enroll.Owner(email))
+		next(w, r, who)
 	}
 }
 
-func sameOrigin(r *http.Request) bool {
+func (s *Server) sameOrigin(r *http.Request) bool {
 	if site := r.Header.Get("Sec-Fetch-Site"); site != "" {
 		return site == "same-origin"
 	}
-	origin, err := url.Parse(r.Header.Get("Origin"))
-	return err == nil && origin.Host != "" && origin.Host == r.Host && (origin.Scheme == "https" || origin.Scheme == "http")
+	from, err := url.Parse(r.Header.Get("Origin"))
+	if err != nil || from.Host == "" || (from.Scheme != "https" && from.Scheme != "http") {
+		return false
+	}
+	return from.Host == r.Host || from.Scheme+"://"+from.Host == s.Origin
 }
 
-func (s *Server) change(next handler) http.HandlerFunc {
-	return s.person(func(w http.ResponseWriter, r *http.Request, email string) {
-		if !sameOrigin(r) {
+func (s *Server) change(next handler) handler {
+	return func(w http.ResponseWriter, r *http.Request, who sealed) {
+		if !s.sameOrigin(r) {
 			http.Error(w, "This change has to come from this site.", http.StatusForbidden)
 			return
 		}
-		next(w, r, email)
-	})
+		next(w, r, who)
+	}
 }
 
-func (s *Server) isAdmin(email string) bool {
-	return slices.ContainsFunc(s.Admins, func(admin string) bool { return enroll.Owner(admin) == email })
+func (s *Server) isAdmin(sub string) bool {
+	return sub != "" && slices.Contains(s.Admins, sub)
 }
 
 func (s *Server) admin(next handler) handler {
-	return func(w http.ResponseWriter, r *http.Request, email string) {
-		if !s.isAdmin(email) {
+	return func(w http.ResponseWriter, r *http.Request, who sealed) {
+		if !s.isAdmin(who.Sub) {
 			http.Error(w, "Only an admin can do this.", http.StatusForbidden)
 			return
 		}
-		next(w, r, email)
+		next(w, r, who)
 	}
-}
-
-func (s *Server) address(device store.Device) string {
-	if device.Status != store.Approved || device.ClientID == "" {
-		return ""
-	}
-	return "https://" + s.DoHHost + "/dns-query/" + device.ClientID
-}
-
-func label(status store.Status) string {
-	switch status {
-	case store.Waiting:
-		return "Waiting for approval"
-	case store.Approved:
-		return "Active"
-	case store.Rejected:
-		return "Rejected"
-	}
-	return string(status)
-}
-
-func (s *Server) view(device store.Device, withAddress bool) view {
-	shown := view{ID: device.ID, Name: device.Name, Owner: device.Owner, Status: string(device.Status), Label: label(device.Status), Created: device.Created}
-	if withAddress {
-		shown.URL = s.address(device)
-	}
-	return shown
 }
 
 func (s *Server) render(w http.ResponseWriter, status int, data page) {
@@ -190,47 +182,119 @@ func (s *Server) render(w http.ResponseWriter, status int, data page) {
 	}
 }
 
-func (s *Server) devicesPage(email string, r *http.Request) (page, error) {
-	state, err := s.Service.Store.Read()
-	if err != nil {
-		return page{}, err
-	}
-	data := page{Email: email, Admin: s.isAdmin(email), Section: "devices", Template: "devices", Notice: notices[r.URL.Query().Get("done")]}
-	for _, device := range state.Devices {
-		if device.Owner == email {
-			data.Devices = append(data.Devices, s.view(device, true))
-		}
-	}
-	return data, nil
+func (s *Server) message(w http.ResponseWriter, status int, heading, message string) {
+	s.render(w, status, page{Template: "message", Heading: heading, Message: message})
 }
 
-func (s *Server) devices(w http.ResponseWriter, r *http.Request, email string) {
-	data, err := s.devicesPage(email, r)
+func (s *Server) signin(w http.ResponseWriter, r *http.Request) {
+	state, nonce, verifier := pawl.Random(), pawl.Random(), pawl.Random()
+	address, err := s.Pawl.AuthorizeURL(r.Context(), state, nonce, pawl.Challenge(verifier))
 	if err != nil {
-		s.fail(w, err)
+		s.Log("sign-in: %v", err)
+		s.message(w, http.StatusBadGateway, "Pawl cannot be reached", "Sign-in goes through Pawl, which is not answering right now. Try again in a moment.")
 		return
 	}
-	s.render(w, http.StatusOK, data)
+	s.keep(w, signinCookie, sealed{Use: useSignin, State: state, Nonce: nonce, Verifier: verifier}, signinFor)
+	http.Redirect(w, r, address, http.StatusFound)
 }
 
-func (s *Server) requestsPage(email string, r *http.Request) (page, error) {
+func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	started, found := s.read(r, signinCookie, useSignin)
+	forget(w, signinCookie)
+	if query.Get("error") != "" {
+		s.message(w, http.StatusUnauthorized, "Sign-in was cancelled", "Nothing was shared.")
+		return
+	}
+	if !found || query.Get("state") == "" || query.Get("state") != started.State {
+		s.message(w, http.StatusBadRequest, "This sign-in has expired", "It was started in another tab or too long ago.")
+		return
+	}
+	person, err := s.Pawl.Exchange(r.Context(), query.Get("code"), started.Verifier, started.Nonce)
+	if err != nil {
+		s.Log("sign-in: %v", err)
+		s.message(w, http.StatusUnauthorized, "Pawl did not confirm who you are", "Nothing was shared.")
+		return
+	}
+	if _, err := s.Service.Seen(r.Context(), enroll.Person{Sub: person.Sub, Email: person.Email, Name: person.Name}); err != nil {
+		s.Log("sign-in for %s: %v", person.Email, err)
+		s.message(w, http.StatusInternalServerError, "Your account could not be read", "Try again in a moment.")
+		return
+	}
+	s.keep(w, sessionCookie, sealed{Use: useSession, Sub: person.Sub, Email: person.Email, Name: person.Name}, sessionFor)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *Server) signout(w http.ResponseWriter, r *http.Request) {
+	if !s.sameOrigin(r) {
+		http.Error(w, "This change has to come from this site.", http.StatusForbidden)
+		return
+	}
+	forget(w, sessionCookie)
+	s.message(w, http.StatusOK, "Signed out of Private DNS", "Your Pawl session stays as it is.")
+}
+
+func (s *Server) address(account store.Account) string {
+	if account.Status != store.Approved || len(account.ClientIDs) == 0 {
+		return ""
+	}
+	return "https://" + s.DoHHost + "/dns-query/" + account.ClientIDs[0]
+}
+
+func label(account store.Account) string {
+	switch {
+	case account.Status == store.Approved && account.Sub == "":
+		return "From before Pawl"
+	case account.Status == store.Approved:
+		return "Active"
+	case account.Status == store.Ended:
+		return "Gone from Pawl"
+	case account.Status == store.Waiting:
+		return "Waiting for approval"
+	}
+	return "No access"
+}
+
+func (s *Server) homePage(r *http.Request, who sealed) (page, error) {
 	state, err := s.Service.Store.Read()
 	if err != nil {
 		return page{}, err
 	}
-	data := page{Email: email, Admin: true, Section: "admin", Template: "admin", Notice: notices[r.URL.Query().Get("done")]}
-	for _, device := range state.Devices {
-		if device.Status == store.Waiting {
-			data.Waiting = append(data.Waiting, s.view(device, false))
-		} else {
-			data.Decided = append(data.Decided, s.view(device, false))
+	data := page{Template: "person", Email: who.Email, Sub: who.Sub, Admin: s.isAdmin(who.Sub), NoAdmin: len(s.Admins) == 0, Status: string(store.Waiting), Notice: notices[r.URL.Query().Get("done")]}
+	for _, account := range state.Accounts {
+		if account.Sub == who.Sub {
+			data.Status = string(account.Status)
+			if address := s.address(account); address != "" {
+				data.Address, data.ClientID = address, account.ClientIDs[0]
+			}
+		}
+	}
+	if data.Admin {
+		data.Template = "admin"
+		legacy := map[string]string{}
+		for _, account := range state.Accounts {
+			if account.Sub == "" && account.Status == store.Approved {
+				legacy[account.Email] = account.ID
+			}
+		}
+		for _, account := range state.Accounts {
+			shown := row{ID: account.ID, Email: account.Email, Name: account.Name, Status: string(account.Status), Label: label(account), Requested: account.Requested}
+			switch account.Status {
+			case store.Waiting:
+				shown.Legacy = legacy[account.Email]
+				data.Waiting = append(data.Waiting, shown)
+			case store.Denied:
+				data.Denied = append(data.Denied, shown)
+			default:
+				data.Accounts = append(data.Accounts, shown)
+			}
 		}
 	}
 	return data, nil
 }
 
-func (s *Server) requests(w http.ResponseWriter, r *http.Request, email string) {
-	data, err := s.requestsPage(email, r)
+func (s *Server) home(w http.ResponseWriter, r *http.Request, who sealed) {
+	data, err := s.homePage(r, who)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -240,26 +304,46 @@ func (s *Server) requests(w http.ResponseWriter, r *http.Request, email string) 
 
 func (s *Server) fail(w http.ResponseWriter, err error) {
 	s.Log("store: %v", err)
-	http.Error(w, "The device list could not be read.", http.StatusInternalServerError)
+	http.Error(w, "The account list could not be read.", http.StatusInternalServerError)
 }
 
-func (s *Server) problem(w http.ResponseWriter, r *http.Request, email string, err error, onAdmin bool) {
+func (s *Server) decide(action string) handler {
+	return func(w http.ResponseWriter, r *http.Request, who sealed) {
+		id := r.PathValue("id")
+		var err error
+		switch action {
+		case "approve":
+			err = s.Service.Approve(r.Context(), id)
+		case "reject":
+			err = s.Service.Reject(id)
+		case "revoke":
+			err = s.Service.Revoke(r.Context(), id)
+		case "renew":
+			err = s.Service.Renew(r.Context(), id)
+		case "link":
+			err = s.Service.Link(id, r.PostFormValue("legacy"))
+		}
+		if err != nil {
+			s.problem(w, r, who, err)
+			return
+		}
+		done := map[string]string{"approve": "approved", "reject": "rejected", "revoke": "revoked", "renew": "renewed", "link": "linked"}[action]
+		s.Log("%s %s an account", who.Email, done)
+		http.Redirect(w, r, "/?done="+done, http.StatusSeeOther)
+	}
+}
+
+func (s *Server) problem(w http.ResponseWriter, r *http.Request, who sealed, err error) {
 	status, message := http.StatusBadGateway, "AdGuard did not take the change, so nothing changed. Try again in a moment."
-	var invalid enroll.Invalid
 	switch {
-	case errors.As(err, &invalid):
-		status, message = http.StatusBadRequest, invalid.Error()
 	case errors.Is(err, enroll.ErrNotFound):
-		status, message = http.StatusNotFound, "There is no such device."
+		status, message = http.StatusNotFound, "There is no such account."
 	case errors.Is(err, enroll.ErrState):
-		status, message = http.StatusConflict, "The device changed in the meantime. Look at it again."
+		status, message = http.StatusConflict, "The account changed in the meantime, or that does not apply to it. Look at it again."
 	default:
-		s.Log("%s %s for %s: %v", r.Method, r.URL.Path, email, err)
+		s.Log("%s %s for %s: %v", r.Method, r.URL.Path, who.Email, err)
 	}
-	data, readErr := s.devicesPage(email, r)
-	if onAdmin {
-		data, readErr = s.requestsPage(email, r)
-	}
+	data, readErr := s.homePage(r, who)
 	if readErr != nil {
 		s.fail(w, readErr)
 		return
@@ -268,61 +352,65 @@ func (s *Server) problem(w http.ResponseWriter, r *http.Request, email string, e
 	s.render(w, status, data)
 }
 
-func done(w http.ResponseWriter, r *http.Request, path, what string) {
-	http.Redirect(w, r, path+"?done="+what, http.StatusSeeOther)
+const cardValueLimit = 70
+
+type card struct {
+	Title   string      `json:"title"`
+	Message string      `json:"message,omitempty"`
+	Fields  []cardField `json:"fields,omitempty"`
+	Action  *cardAction `json:"action,omitempty"`
 }
 
-func (s *Server) request(w http.ResponseWriter, r *http.Request, email string) {
-	device, err := s.Service.Request(email, r.PostFormValue("name"))
+type cardField struct {
+	Label string `json:"label"`
+	Value string `json:"value"`
+	Copy  bool   `json:"copy"`
+}
+
+type cardAction struct {
+	Label string `json:"label"`
+	Href  string `json:"href"`
+}
+
+func (s *Server) cardFor(account store.Account) card {
+	switch account.Status {
+	case store.Approved:
+		fields := []cardField{{Label: "Client ID", Value: account.ClientIDs[0], Copy: true}}
+		if address := s.address(account); utf8.RuneCountInString(address) <= cardValueLimit {
+			fields = append([]cardField{{Label: "DNS address", Value: address, Copy: true}}, fields...)
+		}
+		return card{
+			Title:   "Your DNS address",
+			Message: "Use it as the DNS-over-HTTPS address on your devices.",
+			Fields:  fields,
+			Action:  &cardAction{Label: "Detail", Href: s.Origin + "/"},
+		}
+	case store.Denied:
+		return card{Title: "No access", Message: "The admin has not given you access. Ask them if this is a mistake."}
+	}
+	return card{Title: "Waiting for approval", Message: "Thanks. Your request is with the admin; your DNS address shows here once it is approved."}
+}
+
+func (s *Server) card(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	token, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !found || token == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"invalid_token"}`))
+		return
+	}
+	person, err := s.Pawl.Card(r.Context(), token)
 	if err != nil {
-		s.problem(w, r, email, err, false)
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"invalid_token"}`))
 		return
 	}
-	s.Log("%s asked for %s", email, device.Name)
-	http.Redirect(w, r, "/", http.StatusSeeOther)
-}
-
-func (s *Server) remove(w http.ResponseWriter, r *http.Request, email string) {
-	if err := s.Service.Remove(r.Context(), email, r.PathValue("id")); err != nil {
-		s.problem(w, r, email, err, false)
+	account, err := s.Service.Seen(r.Context(), enroll.Person{Sub: person.Sub, Email: person.Email, Name: person.Name})
+	if err != nil {
+		s.Log("card for %s: %v", person.Email, err)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":"unavailable"}`))
 		return
 	}
-	s.Log("%s removed a device", email)
-	done(w, r, "/", "removed")
-}
-
-func (s *Server) renew(w http.ResponseWriter, r *http.Request, email string) {
-	if err := s.Service.Renew(r.Context(), email, r.PathValue("id")); err != nil {
-		s.problem(w, r, email, err, false)
-		return
-	}
-	s.Log("%s made a new address", email)
-	done(w, r, "/", "renewed")
-}
-
-func (s *Server) approve(w http.ResponseWriter, r *http.Request, email string) {
-	if err := s.Service.Approve(r.Context(), r.PathValue("id")); err != nil {
-		s.problem(w, r, email, err, true)
-		return
-	}
-	s.Log("%s approved a device", email)
-	done(w, r, "/admin", "approved")
-}
-
-func (s *Server) reject(w http.ResponseWriter, r *http.Request, email string) {
-	if err := s.Service.Reject(r.PathValue("id")); err != nil {
-		s.problem(w, r, email, err, true)
-		return
-	}
-	s.Log("%s rejected a device", email)
-	done(w, r, "/admin", "rejected")
-}
-
-func (s *Server) revoke(w http.ResponseWriter, r *http.Request, email string) {
-	if err := s.Service.Revoke(r.Context(), r.PathValue("id")); err != nil {
-		s.problem(w, r, email, err, true)
-		return
-	}
-	s.Log("%s revoked a device", email)
-	done(w, r, "/admin", "revoked")
+	json.NewEncoder(w).Encode(s.cardFor(account))
 }

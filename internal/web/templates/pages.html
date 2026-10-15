@@ -10,82 +10,35 @@
 <body>
 <header class="bar">
 <span class="brand">Private DNS</span>
-{{if .Admin}}<nav>
-<a href="/"{{if eq .Section "devices"}} aria-current="page"{{end}}>My devices</a>
-<a href="/admin"{{if eq .Section "admin"}} aria-current="page"{{end}}>Requests</a>
-</nav>{{end}}
-<span class="who">{{.Email}}</span>
+{{if .Email}}<span class="who">{{.Email}}</span>
+<form method="post" action="/auth/signout" class="signout"><button type="submit">Sign out</button></form>{{end}}
 </header>
 <main>
 {{if .Notice}}<p class="notice" role="status">{{.Notice}}</p>{{end}}
 {{if .Problem}}<p class="problem" role="alert">{{.Problem}}</p>{{end}}
-{{if eq .Template "admin"}}{{template "admin" .}}{{else}}{{template "devices" .}}{{end}}
+{{if eq .Template "admin"}}{{template "admin" .}}{{else if eq .Template "message"}}{{template "message" .}}{{else}}{{template "person" .}}{{end}}
 </main>
 </body>
 </html>
 {{end}}
 
-{{define "devices"}}
-<div class="head">
-<h1>My devices</h1>
-<button type="button" data-open="add-device">Add device…</button>
-</div>
-{{if not .Devices}}<p class="empty">No devices yet. Add one to get your own DNS address.</p>{{end}}
-<ul class="list">
-{{range .Devices}}
-<li class="item">
-<div class="row">
-<div class="what">
-<span class="name">{{.Name}}</span>
-<span class="status status-{{.Status}}">{{.Label}}</span>
-</div>
-<details class="menu">
-<summary aria-label="{{.Name}} actions">⋯</summary>
-<div class="menu-items">
-{{if eq .Status "approved"}}<button type="button" data-open="renew-{{.ID}}">New address…</button>{{end}}
-<button type="button" data-open="remove-{{.ID}}">Remove…</button>
-</div>
-</details>
-</div>
-{{if .URL}}<div class="address">
-<code>{{.URL}}</code>
-<button type="button" data-copy="{{.URL}}">Copy</button>
-</div>{{end}}
-<dialog id="renew-{{.ID}}">
-<form method="post" action="/devices/{{.ID}}/renew">
-<h2>New address for {{.Name}}?</h2>
-<p>The current address stops working as soon as the new one is made. Put the new one in place on this device.</p>
-<div class="actions">
-<button type="button" data-close>Cancel</button>
-<button type="submit">Make new address</button>
-</div>
-</form>
-</dialog>
-<dialog id="remove-{{.ID}}">
-<form method="post" action="/devices/{{.ID}}/remove">
-<h2>Remove {{.Name}}?</h2>
-<p>Its address stops working.</p>
-<div class="actions">
-<button type="button" data-close>Cancel</button>
-<button type="submit" class="danger">Remove</button>
-</div>
-</form>
-</dialog>
-</li>
+{{define "message"}}
+<h1>{{.Heading}}</h1>
+<p>{{.Message}}</p>
+<p><a href="/auth/signin">Sign in again</a></p>
 {{end}}
-</ul>
-<dialog id="add-device">
-<form method="post" action="/devices">
-<h2>Add device</h2>
-<label for="device-name">Name</label>
-<input id="device-name" name="name" maxlength="40" required placeholder="Phone" autocomplete="off">
-<p class="hint">You get its address once it is approved.</p>
-<div class="actions">
-<button type="button" data-close>Cancel</button>
-<button type="submit">Request</button>
+
+{{define "own"}}
+{{if .Address}}
+<div class="address">
+<code>{{.Address}}</code>
+<button type="button" data-copy="{{.Address}}">Copy</button>
 </div>
-</form>
-</dialog>
+<p class="hint">Client ID <code>{{.ClientID}}</code> <button type="button" data-copy="{{.ClientID}}">Copy</button></p>
+{{end}}
+{{end}}
+
+{{define "setup"}}
 <section class="help">
 <h2>Set it up</h2>
 <ul>
@@ -93,11 +46,29 @@
 <li><strong>Firefox</strong>: Settings, Privacy &amp; Security, DNS over HTTPS, Max Protection, custom; paste the address.</li>
 <li><strong>Phones</strong>: use a browser or an app that takes a DNS-over-HTTPS address. Android's Private DNS needs a different kind of address, which this server does not offer.</li>
 </ul>
+<p class="note">Every device of yours uses this one address. Lost a device or shared the address by mistake? Ask the admin for a new one.</p>
 <p class="note">The person who runs this server can see the names your devices look up.</p>
 </section>
 {{end}}
 
+{{define "person"}}
+{{if eq .Status "approved"}}
+<h1>Your DNS address</h1>
+{{template "own" .}}
+<p>Need a new address? Ask the admin.</p>
+{{template "setup" .}}
+{{else if eq .Status "denied"}}
+<h1>No access</h1>
+<p>The admin has not given you access. Ask them if this is a mistake.</p>
+{{else}}
+<h1>Waiting for approval</h1>
+<p>Thanks. Your request is with the admin. Your address shows here, and on your Pawl card, once it is approved.</p>
+{{end}}
+{{if .NoAdmin}}<p class="note">No admin is set yet. To make this account the admin, set <code>ADMIN_SUBJECTS</code> to <code>{{.Sub}}</code> and restart the app.</p>{{end}}
+{{end}}
+
 {{define "admin"}}
+{{if .Address}}<h1>Your DNS address</h1>{{template "own" .}}{{end}}
 <h1>Requests</h1>
 {{if not .Waiting}}<p class="empty">No requests waiting.</p>{{end}}
 <ul class="list">
@@ -105,47 +76,75 @@
 <li class="item">
 <div class="row">
 <div class="what">
-<span class="name">{{.Name}}</span>
-<span class="owner">{{.Owner}}</span>
-<time datetime="{{.Created.UTC.Format "2006-01-02T15:04:05Z"}}">{{.Created.UTC.Format "2 Jan 2006 15:04 UTC"}}</time>
+<span class="name">{{.Email}}</span>
+{{if .Name}}<span class="owner">{{.Name}}</span>{{end}}
+<time datetime="{{.Requested.UTC.Format "2006-01-02T15:04:05Z"}}">{{.Requested.UTC.Format "2 Jan 2006 15:04 UTC"}}</time>
 </div>
 <div class="actions">
-<form method="post" action="/admin/devices/{{.ID}}/reject"><button type="submit">Reject</button></form>
-<form method="post" action="/admin/devices/{{.ID}}/approve"><button type="submit">Approve</button></form>
+<form method="post" action="/admin/accounts/{{.ID}}/reject"><button type="submit">Reject</button></form>
+{{if .Legacy}}<form method="post" action="/admin/accounts/{{.ID}}/link"><input type="hidden" name="legacy" value="{{.Legacy}}"><button type="submit">Link to the old account</button></form>{{end}}
+<form method="post" action="/admin/accounts/{{.ID}}/approve"><button type="submit">Approve</button></form>
 </div>
 </div>
 </li>
 {{end}}
 </ul>
-<h2>Devices</h2>
-{{if not .Decided}}<p class="empty">No devices yet.</p>{{end}}
+<h2>Accounts</h2>
+{{if not .Accounts}}<p class="empty">No accounts yet.</p>{{end}}
 <ul class="list">
-{{range .Decided}}
+{{range .Accounts}}
 <li class="item">
 <div class="row">
 <div class="what">
-<span class="name">{{.Name}}</span>
+<span class="name">{{.Email}}</span>
 <span class="status status-{{.Status}}">{{.Label}}</span>
-<span class="owner">{{.Owner}}</span>
 </div>
 <details class="menu">
-<summary aria-label="{{.Name}} actions">⋯</summary>
+<summary aria-label="{{.Email}} actions">⋯</summary>
 <div class="menu-items">
-<button type="button" data-open="revoke-{{.ID}}">{{if eq .Status "approved"}}Revoke…{{else}}Remove…{{end}}</button>
+{{if eq .Status "approved"}}<button type="button" data-open="renew-{{.ID}}">New address…</button>{{end}}
+<button type="button" data-open="revoke-{{.ID}}">Revoke…</button>
 </div>
 </details>
 </div>
-<dialog id="revoke-{{.ID}}">
-<form method="post" action="/admin/devices/{{.ID}}/revoke">
-<h2>{{if eq .Status "approved"}}Revoke{{else}}Remove{{end}} {{.Name}} of {{.Owner}}?</h2>
-<p>{{if eq .Status "approved"}}Its address stops working at once.{{else}}The request is removed.{{end}}</p>
+<dialog id="renew-{{.ID}}">
+<form method="post" action="/admin/accounts/{{.ID}}/renew">
+<h2>New address for {{.Email}}?</h2>
+<p>The current address stops working as soon as the new one is made. Every device of theirs needs the new one.</p>
 <div class="actions">
 <button type="button" data-close>Cancel</button>
-<button type="submit" class="danger">{{if eq .Status "approved"}}Revoke{{else}}Remove{{end}}</button>
+<button type="submit">Make new address</button>
+</div>
+</form>
+</dialog>
+<dialog id="revoke-{{.ID}}">
+<form method="post" action="/admin/accounts/{{.ID}}/revoke">
+<h2>Revoke {{.Email}}?</h2>
+<p>Their address stops working at once. You can approve them again later; they get a new address then.</p>
+<div class="actions">
+<button type="button" data-close>Cancel</button>
+<button type="submit" class="danger">Revoke</button>
 </div>
 </form>
 </dialog>
 </li>
 {{end}}
 </ul>
+{{if .Denied}}
+<h2>No access</h2>
+<ul class="list">
+{{range .Denied}}
+<li class="item">
+<div class="row">
+<div class="what">
+<span class="name">{{.Email}}</span>
+</div>
+<div class="actions">
+<form method="post" action="/admin/accounts/{{.ID}}/approve"><button type="submit">Approve</button></form>
+</div>
+</div>
+</li>
+{{end}}
+</ul>
+{{end}}
 {{end}}

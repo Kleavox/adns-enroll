@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Kleavox/adns-enroll/internal/adguard"
 	"github.com/Kleavox/adns-enroll/internal/enroll"
+	"github.com/Kleavox/adns-enroll/internal/pawl"
 	"github.com/Kleavox/adns-enroll/internal/store"
 	"github.com/Kleavox/adns-enroll/internal/web"
 )
@@ -23,6 +25,8 @@ var version = "dev"
 const (
 	reconcileEvery = 10 * time.Minute
 	retryAfter     = 30 * time.Second
+	subjectsEvery  = 6 * time.Hour
+	subjectsPerAsk = 1000
 )
 
 func pause(err error) time.Duration {
@@ -71,7 +75,19 @@ func run() error {
 		return fmt.Errorf("read %s: %w", store.File, err)
 	}
 	service := &enroll.Service{Store: saved, DNS: adguard.New(c.AdGuardURL, c.AdGuardUser, c.AdGuardPassword, nil), Now: time.Now}
-	server := &web.Server{Service: service, Identity: c.identity(), Admins: c.Admins, DoHHost: c.DoHHost, Log: log.Printf}
+	if err := service.Migrate(); err != nil {
+		return fmt.Errorf("move devices to accounts: %w", err)
+	}
+	for _, old := range c.Retired {
+		log.Printf("%s is no longer read; sign-in goes through Pawl", old)
+	}
+	server := &web.Server{Service: service, Admins: c.Admins, DoHHost: c.DoHHost, Origin: c.Origin, Missing: c.signInMissing(), Log: log.Printf, Now: time.Now}
+	var provider *pawl.Provider
+	if server.Missing == "" {
+		provider = pawl.New(c.Issuer, c.ClientID, c.ClientSecret, c.Origin+"/auth/callback")
+		server.Pawl = provider
+		server.Key = c.sessionKey()
+	}
 	httpServer := &http.Server{
 		Addr:              c.Listen,
 		Handler:           server.Handler(),
@@ -84,6 +100,9 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go reconcile(ctx, service)
+	if provider != nil {
+		go watchSubjects(ctx, service, provider.Live)
+	}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -107,6 +126,37 @@ func reconcile(ctx context.Context, service *enroll.Service) {
 		case <-ctx.Done():
 			return
 		case <-time.After(pause(err)):
+		}
+	}
+}
+
+type liveSubjects func(ctx context.Context, subjects []string) ([]string, error)
+
+func liveRound(ctx context.Context, service *enroll.Service, live liveSubjects) error {
+	subjects, err := service.Subjects()
+	if err != nil {
+		return err
+	}
+	var still []string
+	for chunk := range slices.Chunk(subjects, subjectsPerAsk) {
+		known, err := live(ctx, chunk)
+		if err != nil {
+			return err
+		}
+		still = append(still, known...)
+	}
+	return service.EndMissing(ctx, subjects, still)
+}
+
+func watchSubjects(ctx context.Context, service *enroll.Service, live liveSubjects) {
+	for {
+		if err := liveRound(ctx, service, live); err != nil && ctx.Err() == nil {
+			log.Printf("ask Pawl which accounts still exist: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(subjectsEvery):
 		}
 	}
 }

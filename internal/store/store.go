@@ -16,24 +16,38 @@ type Status string
 const (
 	Waiting  Status = "waiting"
 	Approved Status = "approved"
-	Rejected Status = "rejected"
+	Denied   Status = "denied"
+	Ended    Status = "ended"
 )
+
+type Account struct {
+	ID         string    `json:"id"`
+	Sub        string    `json:"sub,omitempty"`
+	Email      string    `json:"email"`
+	Name       string    `json:"name,omitempty"`
+	Status     Status    `json:"status"`
+	ClientIDs  []string  `json:"clientIds,omitempty"`
+	ClientName string    `json:"clientName,omitempty"`
+	Requested  time.Time `json:"requested"`
+	Decided    time.Time `json:"decided,omitzero"`
+}
 
 type Device struct {
 	ID       string    `json:"id"`
 	Owner    string    `json:"owner"`
 	Name     string    `json:"name"`
-	Status   Status    `json:"status"`
+	Status   string    `json:"status"`
 	ClientID string    `json:"clientId,omitempty"`
 	Created  time.Time `json:"created"`
 	Decided  time.Time `json:"decided,omitzero"`
 }
 
 type State struct {
-	Devices []Device `json:"devices"`
-	Retired []string `json:"retired"`
+	Accounts []Account `json:"accounts"`
+	Retired  []string  `json:"retired"`
+	Made     []string  `json:"made"`
+	Devices  []Device  `json:"devices,omitempty"`
 }
-
 type Store struct {
 	path string
 	mu   sync.Mutex
@@ -53,7 +67,7 @@ func (s *Store) Read() (State, error) {
 }
 
 func (s *Store) read() (State, error) {
-	state := State{Devices: []Device{}, Retired: []string{}}
+	state := State{Accounts: []Account{}, Retired: []string{}, Made: []string{}}
 	body, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return state, nil

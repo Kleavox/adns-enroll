@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+const nobody = "192.0.2.1"
+
 type Client struct {
 	base     string
 	user     string
@@ -149,7 +151,7 @@ func (c *Client) Allow(ctx context.Context, id string) error {
 	if slices.Contains(allowed, id) {
 		return nil
 	}
-	list["allowed_clients"] = append(allowed, id)
+	list["allowed_clients"] = append(slices.DeleteFunc(allowed, func(item string) bool { return item == nobody }), id)
 	return c.call(ctx, http.MethodPost, "access/set", list, nil)
 }
 
@@ -161,6 +163,9 @@ func (c *Client) Disallow(ctx context.Context, ids ...string) error {
 	kept := slices.DeleteFunc(slices.Clone(allowed), func(item string) bool { return slices.Contains(ids, item) })
 	if len(kept) == len(allowed) {
 		return nil
+	}
+	if len(kept) == 0 {
+		kept = []string{nobody}
 	}
 	list["allowed_clients"] = kept
 	return c.call(ctx, http.MethodPost, "access/set", list, nil)

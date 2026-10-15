@@ -2,12 +2,11 @@ package web
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -15,19 +14,11 @@ import (
 
 	"github.com/Kleavox/adns-enroll/internal/adguard"
 	"github.com/Kleavox/adns-enroll/internal/enroll"
+	"github.com/Kleavox/adns-enroll/internal/pawl"
 	"github.com/Kleavox/adns-enroll/internal/store"
 )
 
-const host = "dns-io.kleavox.xyz"
-
-type signedIn struct{}
-
-func (signedIn) Email(r *http.Request) (string, error) {
-	if email := r.Header.Get("X-Test-Email"); email != "" {
-		return email, nil
-	}
-	return "", errors.New("not signed in")
-}
+const origin = "https://enroll.example.test"
 
 type quiet struct {
 	clients map[string][]string
@@ -63,225 +54,423 @@ func (q *quiet) Disallow(_ context.Context, ids ...string) error {
 	return nil
 }
 
+type fakePawl struct {
+	people    map[string]pawl.Person
+	exchanged []string
+}
+
+func (f *fakePawl) AuthorizeURL(_ context.Context, state, nonce, challenge string) (string, error) {
+	return "https://paw.example.test/oauth/authorize?" + url.Values{"state": {state}, "nonce": {nonce}, "code_challenge": {challenge}}.Encode(), nil
+}
+
+func (f *fakePawl) Exchange(_ context.Context, code, verifier, nonce string) (pawl.Person, error) {
+	f.exchanged = append(f.exchanged, code+" "+pawl.Challenge(verifier)+" "+nonce)
+	person, found := f.people[code]
+	if !found {
+		return pawl.Person{}, pawl.ErrDenied
+	}
+	return person, nil
+}
+
+func (f *fakePawl) Card(_ context.Context, token string) (pawl.Person, error) {
+	person, found := f.people["card:"+token]
+	if !found {
+		return pawl.Person{}, pawl.ErrDenied
+	}
+	return person, nil
+}
+
+var (
+	owner = pawl.Person{Sub: "pairwise-owner", Email: "owner@example.com", Name: "owner"}
+	budi  = pawl.Person{Sub: "pairwise-budi", Email: "budi@example.com", Name: "budi"}
+)
+
 type app struct {
 	handler http.Handler
 	service *enroll.Service
 	dns     *quiet
+	pawl    *fakePawl
 }
 
-func newApp(t *testing.T) app {
+func newApp(t *testing.T, admins ...string) app {
 	t.Helper()
 	saved, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	dns := &quiet{clients: map[string][]string{}}
-	service := &enroll.Service{Store: saved, DNS: dns, Now: func() time.Time { return time.Date(2026, 10, 12, 9, 0, 0, 0, time.UTC) }}
-	server := &Server{Service: service, Identity: signedIn{}, Admins: []string{"admin@example.com"}, DoHHost: "dns.kleavox.xyz", Log: func(string, ...any) {}}
-	return app{handler: server.Handler(), service: service, dns: dns}
+	now := time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC)
+	service := &enroll.Service{Store: saved, DNS: dns, Now: func() time.Time { return now }}
+	fake := &fakePawl{people: map[string]pawl.Person{
+		"owner-code": owner, "budi-code": budi,
+		"card:owner-card": owner, "card:budi-card": budi,
+	}}
+	server := &Server{
+		Service: service,
+		Pawl:    fake,
+		Admins:  admins,
+		DoHHost: "dns.example.test",
+		Origin:  origin,
+		Key:     []byte("a session key for the tests only"),
+		Log:     func(string, ...any) {},
+		Now:     func() time.Time { return now },
+	}
+	return app{handler: server.Handler(), service: service, dns: dns, pawl: fake}
 }
 
-func (a app) get(path, email string) *httptest.ResponseRecorder {
-	r := httptest.NewRequest(http.MethodGet, "https://"+host+path, nil)
-	if email != "" {
-		r.Header.Set("X-Test-Email", email)
-	}
+func (a app) do(r *http.Request) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	a.handler.ServeHTTP(w, r)
 	return w
 }
 
-func (a app) post(path, email, origin string, form url.Values) *httptest.ResponseRecorder {
-	r := httptest.NewRequest(http.MethodPost, "https://"+host+path, strings.NewReader(form.Encode()))
+func (a app) get(path string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(http.MethodGet, origin+path, nil)
+	for _, cookie := range cookies {
+		r.AddCookie(cookie)
+	}
+	return a.do(r)
+}
+
+func (a app) post(path, from string, form url.Values, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(http.MethodPost, origin+path, strings.NewReader(form.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if email != "" {
-		r.Header.Set("X-Test-Email", email)
+	if from != "" {
+		r.Header.Set("Origin", from)
 	}
-	if origin != "" {
-		r.Header.Set("Origin", origin)
+	for _, cookie := range cookies {
+		r.AddCookie(cookie)
 	}
-	w := httptest.NewRecorder()
-	a.handler.ServeHTTP(w, r)
-	return w
+	return a.do(r)
 }
 
-const self = "https://" + host
+func cookie(t *testing.T, w *httptest.ResponseRecorder, name string) *http.Cookie {
+	t.Helper()
+	for _, c := range w.Result().Cookies() {
+		if c.Name == name {
+			return c
+		}
+	}
+	t.Fatalf("no %s cookie in %v", name, w.Header().Values("Set-Cookie"))
+	return nil
+}
 
-func body(w *httptest.ResponseRecorder) string {
+func signIn(t *testing.T, a app, code string) *http.Cookie {
+	t.Helper()
+	started := a.get("/auth/signin")
+	if started.Code != http.StatusFound {
+		t.Fatalf("sign-in answered %d", started.Code)
+	}
+	target, _ := url.Parse(started.Header().Get("Location"))
+	signin := cookie(t, started, "__Host-adns-signin")
+	back := a.get("/auth/callback?"+url.Values{"code": {code}, "state": {target.Query().Get("state")}}.Encode(), signin)
+	if back.Code != http.StatusSeeOther || back.Header().Get("Location") != "/" {
+		t.Fatalf("callback answered %d: %s", back.Code, back.Body.String())
+	}
+	return cookie(t, back, "__Host-adns")
+}
+
+func text(w *httptest.ResponseRecorder) string {
 	raw, _ := io.ReadAll(w.Body)
 	return string(raw)
 }
 
-func (a app) only(t *testing.T) store.Device {
+func account(t *testing.T, a app, sub string) store.Account {
 	t.Helper()
 	state, err := a.service.Store.Read()
-	if err != nil || len(state.Devices) != 1 {
-		t.Fatalf("state %#v err %v", state, err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return state.Devices[0]
-}
-
-func TestNobodyGetsInWithoutSigningIn(t *testing.T) {
-	a := newApp(t)
-	for _, path := range []string{"/", "/admin"} {
-		if w := a.get(path, ""); w.Code != http.StatusUnauthorized {
-			t.Fatalf("%s: %d", path, w.Code)
+	for _, each := range state.Accounts {
+		if each.Sub == sub {
+			return each
 		}
 	}
-	if w := a.post("/devices", "", self, url.Values{"name": {"Phone"}}); w.Code != http.StatusUnauthorized {
-		t.Fatalf("post: %d", w.Code)
-	}
-	if w := a.get("/healthz", ""); w.Code != http.StatusOK || body(w) != "ok" {
-		t.Fatalf("health: %d", w.Code)
-	}
+	t.Fatalf("no account for %s", sub)
+	return store.Account{}
 }
 
-type unready struct{}
-
-func (unready) Email(*http.Request) (string, error) {
-	return "", Unready("Sign-in is not set up yet: ACCESS_AUD is missing.")
-}
-
-func TestAnAppWithoutSignInSetUpSaysSo(t *testing.T) {
+func TestASignedOutVisitIsSentToPawl(t *testing.T) {
 	a := newApp(t)
-	server := &Server{Service: a.service, Identity: unready{}, DoHHost: "dns.kleavox.xyz", Log: func(string, ...any) {}}
-	r := httptest.NewRequest(http.MethodGet, "https://"+host+"/", nil)
-	w := httptest.NewRecorder()
-	server.Handler().ServeHTTP(w, r)
-	if w.Code != http.StatusServiceUnavailable || !strings.Contains(body(w), "ACCESS_AUD") {
-		t.Fatalf("code %d", w.Code)
+	w := a.get("/")
+	if w.Code != http.StatusFound || w.Header().Get("Location") != "/auth/signin" {
+		t.Fatalf("answered %d %s", w.Code, w.Header().Get("Location"))
 	}
 }
 
-func TestAPersonRequestsADeviceAndSeesItWait(t *testing.T) {
+func TestSignInUsesPKCEStateAndNonceKeptInAHostCookie(t *testing.T) {
 	a := newApp(t)
-	w := a.post("/devices", "budi@example.com", self, url.Values{"name": {"Phone"}})
-	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/" {
-		t.Fatalf("code %d location %q", w.Code, w.Header().Get("Location"))
+	w := a.get("/auth/signin")
+	target, _ := url.Parse(w.Header().Get("Location"))
+	if target.Host != "paw.example.test" || target.Query().Get("state") == "" || target.Query().Get("nonce") == "" || len(target.Query().Get("code_challenge")) != 43 {
+		t.Fatalf("location %s", target)
 	}
-	page := body(a.get("/", "budi@example.com"))
-	if !strings.Contains(page, `<span class="name">Phone</span>`) || !strings.Contains(page, "Waiting for approval") {
+	c := cookie(t, w, "__Host-adns-signin")
+	if !c.Secure || !c.HttpOnly || c.Path != "/" || c.SameSite != http.SameSiteLaxMode || c.Domain != "" {
+		t.Fatalf("cookie %#v", c)
+	}
+	session := signIn(t, a, "budi-code")
+	if !session.Secure || !session.HttpOnly || session.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("session %#v", session)
+	}
+	exchanged := strings.Fields(a.pawl.exchanged[len(a.pawl.exchanged)-1])
+	if exchanged[0] != "budi-code" || len(exchanged) != 3 {
+		t.Fatalf("exchanged %v", a.pawl.exchanged)
+	}
+	if got := account(t, a, budi.Sub); got.Status != store.Waiting || got.Email != budi.Email {
+		t.Fatalf("account %#v", got)
+	}
+}
+
+func TestACallbackThatIsNotThisBrowsersSignInIsRefused(t *testing.T) {
+	a := newApp(t)
+	started := a.get("/auth/signin")
+	target, _ := url.Parse(started.Header().Get("Location"))
+	signin := cookie(t, started, "__Host-adns-signin")
+	state := target.Query().Get("state")
+	tampered := *signin
+	tampered.Value = strings.Replace(signin.Value, ".", ".x", 1)
+	for name, w := range map[string]*httptest.ResponseRecorder{
+		"another state":  a.get("/auth/callback?code=budi-code&state=other", signin),
+		"no cookie":      a.get("/auth/callback?code=budi-code&state=" + state),
+		"a forged one":   a.get("/auth/callback?code=budi-code&state="+state, &tampered),
+		"a refused code": a.get("/auth/callback?code=nobody&state="+state, signin),
+	} {
+		if w.Code == http.StatusSeeOther {
+			t.Errorf("%s signed someone in", name)
+		}
+		for _, c := range w.Result().Cookies() {
+			if c.Name == "__Host-adns" && c.Value != "" {
+				t.Errorf("%s set a session", name)
+			}
+		}
+	}
+	if cancelled := a.get("/auth/callback?error=access_denied&state="+state, signin); !strings.Contains(text(cancelled), "Sign in again") {
+		t.Fatal("a cancelled sign-in does not offer another go")
+	}
+}
+
+func TestAForgedSessionIsNoSession(t *testing.T) {
+	a := newApp(t)
+	session := signIn(t, a, "budi-code")
+	forged := *session
+	forged.Value = "x" + session.Value
+	if w := a.get("/", &forged); w.Code != http.StatusFound {
+		t.Fatalf("a forged session answered %d", w.Code)
+	}
+}
+
+func TestAPersonSeesTheirOwnStateAndNeverAnyoneElses(t *testing.T) {
+	a := newApp(t, owner.Sub)
+	session := signIn(t, a, "budi-code")
+	if page := text(a.get("/", session)); !strings.Contains(page, "Waiting for approval") {
 		t.Fatalf("page %s", page)
 	}
-	if other := body(a.get("/", "sari@example.com")); strings.Contains(other, `<span class="name">Phone</span>`) {
-		t.Fatal("another person sees the device")
+	if err := a.service.Approve(context.Background(), account(t, a, budi.Sub).ID); err != nil {
+		t.Fatal(err)
+	}
+	approved := account(t, a, budi.Sub)
+	page := text(a.get("/", session))
+	if !strings.Contains(page, "https://dns.example.test/dns-query/"+approved.ClientIDs[0]) || !strings.Contains(page, "Ask the admin") {
+		t.Fatalf("page %s", page)
+	}
+	if strings.Contains(page, "Requests") {
+		t.Fatal("a person sees the admin's requests")
+	}
+	if w := a.post("/admin/accounts/"+approved.ID+"/revoke", origin, nil, session); w.Code != http.StatusForbidden {
+		t.Fatalf("a person revoked an account: %d", w.Code)
 	}
 }
 
-func TestChangesFromAnotherSiteAreRefused(t *testing.T) {
+func TestWithNoAdminYetAPersonIsToldTheirSubject(t *testing.T) {
 	a := newApp(t)
-	for _, origin := range []string{"", "https://evil.example.com", "null", "https://" + host + ".evil.example.com"} {
-		if w := a.post("/devices", "budi@example.com", origin, url.Values{"name": {"Phone"}}); w.Code != http.StatusForbidden {
-			t.Fatalf("origin %q: %d", origin, w.Code)
+	session := signIn(t, a, "owner-code")
+	if page := text(a.get("/", session)); !strings.Contains(page, "ADMIN_SUBJECTS") || !strings.Contains(page, owner.Sub) {
+		t.Fatalf("page %s", page)
+	}
+}
+
+func TestTheAdminDecidesOnRequestsFromThisSiteOnly(t *testing.T) {
+	a := newApp(t, owner.Sub)
+	admin := signIn(t, a, "owner-code")
+	signIn(t, a, "budi-code")
+	page := text(a.get("/", admin))
+	if !strings.Contains(page, "Requests") || !strings.Contains(page, budi.Email) {
+		t.Fatalf("page %s", page)
+	}
+	id := account(t, a, budi.Sub).ID
+	if w := a.post("/admin/accounts/"+id+"/approve", "https://evil.test", nil, admin); w.Code != http.StatusForbidden {
+		t.Fatalf("a foreign form approved: %d", w.Code)
+	}
+	if w := a.post("/admin/accounts/"+id+"/approve", origin, nil, admin); w.Code != http.StatusSeeOther {
+		t.Fatalf("approve answered %d: %s", w.Code, text(w))
+	}
+	if account(t, a, budi.Sub).Status != store.Approved {
+		t.Fatal("not approved")
+	}
+	before := account(t, a, budi.Sub).ClientIDs[0]
+	if w := a.post("/admin/accounts/"+id+"/renew", origin, nil, admin); w.Code != http.StatusSeeOther {
+		t.Fatalf("renew answered %d", w.Code)
+	}
+	if account(t, a, budi.Sub).ClientIDs[0] == before {
+		t.Fatal("no new address")
+	}
+	if w := a.post("/admin/accounts/"+id+"/revoke", origin, nil, admin); w.Code != http.StatusSeeOther {
+		t.Fatalf("revoke answered %d", w.Code)
+	}
+	if account(t, a, budi.Sub).Status != store.Denied {
+		t.Fatal("not revoked")
+	}
+}
+
+func TestTheAdminLinksAPawlAccountToTheAddressesFromBefore(t *testing.T) {
+	a := newApp(t, "pairwise-admin")
+	err := a.service.Store.Update(func(state *store.State) error {
+		state.Accounts = append(state.Accounts, store.Account{ID: "legacy1", Email: budi.Email, Status: store.Approved, ClientIDs: []string{"11111111111111111111111111111111"}, ClientName: "Phone · budi@example.com · d1"})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.pawl.people["admin-code"] = pawl.Person{Sub: "pairwise-admin", Email: "admin@example.com"}
+	admin := signIn(t, a, "admin-code")
+	signIn(t, a, "budi-code")
+	page := text(a.get("/", admin))
+	if !strings.Contains(page, "Link to the old account") {
+		t.Fatalf("page %s", page)
+	}
+	id := account(t, a, budi.Sub).ID
+	if w := a.post("/admin/accounts/"+id+"/link", origin, url.Values{"legacy": {"legacy1"}}, admin); w.Code != http.StatusSeeOther {
+		t.Fatalf("link answered %d: %s", w.Code, text(w))
+	}
+	if got := account(t, a, budi.Sub); got.Status != store.Approved || got.ClientIDs[0] != "11111111111111111111111111111111" {
+		t.Fatalf("account %#v", got)
+	}
+}
+
+type answer struct {
+	Title   string `json:"title"`
+	Message string `json:"message"`
+	Fields  []struct {
+		Label string `json:"label"`
+		Value string `json:"value"`
+		Copy  bool   `json:"copy"`
+	} `json:"fields"`
+	Action *struct {
+		Label string `json:"label"`
+		Href  string `json:"href"`
+	} `json:"action"`
+}
+
+func (a app) card(t *testing.T, token string) (int, answer) {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodGet, origin+"/.well-known/pawl/card", nil)
+	if token != "" {
+		r.Header.Set("Authorization", "Bearer "+token)
+	}
+	w := a.do(r)
+	var card answer
+	json.NewDecoder(w.Body).Decode(&card)
+	if w.Code == http.StatusOK && w.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("cache %q", w.Header().Get("Cache-Control"))
+	}
+	return w.Code, card
+}
+
+func withinPawlsLimits(t *testing.T, card answer) {
+	t.Helper()
+	length := func(value string) int { return len([]rune(value)) }
+	if length(card.Title) < 1 || length(card.Title) > 40 || length(card.Message) > 90 || len(card.Fields) > 2 {
+		t.Fatalf("card %#v", card)
+	}
+	for _, field := range card.Fields {
+		if length(field.Label) > 20 || length(field.Value) > 70 {
+			t.Fatalf("field %#v", field)
 		}
 	}
-	if state, _ := a.service.Store.Read(); len(state.Devices) != 0 {
-		t.Fatalf("state %#v", state)
+	if card.Action != nil && (length(card.Action.Label) > 16 || !strings.HasPrefix(card.Action.Href, origin+"/")) {
+		t.Fatalf("action %#v", card.Action)
 	}
 }
 
-func (a app) fetched(site, origin, requestHost string) int {
-	r := httptest.NewRequest(http.MethodPost, "https://"+requestHost+"/devices", strings.NewReader(url.Values{"name": {"Phone"}}.Encode()))
-	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r.Header.Set("X-Test-Email", "budi@example.com")
-	r.Header.Set("Origin", origin)
-	r.Header.Set("Sec-Fetch-Site", site)
+func TestTheCardThanksANewcomerAndHoldsThemUntilApproved(t *testing.T) {
+	a := newApp(t, owner.Sub)
+	if status, _ := a.card(t, ""); status != http.StatusUnauthorized {
+		t.Fatalf("no token answered %d", status)
+	}
+	if status, _ := a.card(t, "forged"); status != http.StatusUnauthorized {
+		t.Fatalf("a forged token answered %d", status)
+	}
+	status, card := a.card(t, "budi-card")
+	if status != http.StatusOK || card.Title != "Waiting for approval" || !strings.Contains(card.Message, "Thanks") || len(card.Fields) != 0 {
+		t.Fatalf("card %d %#v", status, card)
+	}
+	withinPawlsLimits(t, card)
+	if account(t, a, budi.Sub).Status != store.Waiting {
+		t.Fatal("the newcomer was not recorded")
+	}
+	if err := a.service.Approve(context.Background(), account(t, a, budi.Sub).ID); err != nil {
+		t.Fatal(err)
+	}
+	approved := account(t, a, budi.Sub)
+	_, card = a.card(t, "budi-card")
+	withinPawlsLimits(t, card)
+	if card.Title != "Your DNS address" || len(card.Fields) != 2 ||
+		card.Fields[0].Value != "https://dns.example.test/dns-query/"+approved.ClientIDs[0] || card.Fields[1].Value != approved.ClientIDs[0] ||
+		!card.Fields[0].Copy || card.Action == nil || card.Action.Label != "Detail" || card.Action.Href != origin+"/" {
+		t.Fatalf("card %#v", card)
+	}
+	if err := a.service.Revoke(context.Background(), approved.ID); err != nil {
+		t.Fatal(err)
+	}
+	_, card = a.card(t, "budi-card")
+	withinPawlsLimits(t, card)
+	if card.Title != "No access" || len(card.Fields) != 0 {
+		t.Fatalf("card %#v", card)
+	}
+}
+
+func TestAnAddressTooLongForTheCardIsLeftToDetail(t *testing.T) {
+	server := &Server{DoHHost: "resolver.a-rather-long-private-dns-name.example.test", Origin: origin}
+	account := store.Account{Status: store.Approved, ClientIDs: []string{"0123456789abcdef0123456789abcdef"}}
+	raw, _ := json.Marshal(server.cardFor(account))
+	var card answer
+	if err := json.Unmarshal(raw, &card); err != nil {
+		t.Fatal(err)
+	}
+	withinPawlsLimits(t, card)
+	if len(card.Fields) != 1 || card.Fields[0].Label != "Client ID" || card.Action == nil {
+		t.Fatalf("card %#v", card)
+	}
+}
+
+func TestNothingAnswersBeforeSignInIsSetUp(t *testing.T) {
+	saved, _ := store.Open(t.TempDir())
+	server := &Server{Service: &enroll.Service{Store: saved, DNS: &quiet{clients: map[string][]string{}}, Now: time.Now}, Missing: "PAWL_CLIENT_SECRET", Log: func(string, ...any) {}, Now: time.Now}
+	handler := server.Handler()
+	for _, path := range []string{"/", "/auth/signin", "/.well-known/pawl/card"} {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, origin+path, nil))
+		if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "PAWL_CLIENT_SECRET") {
+			t.Fatalf("%s answered %d %s", path, w.Code, w.Body.String())
+		}
+	}
 	w := httptest.NewRecorder()
-	a.handler.ServeHTTP(w, r)
-	return w.Code
-}
-
-func TestTheBrowserSaysWhetherAChangeCameFromThisSite(t *testing.T) {
-	a := newApp(t)
-	if code := a.fetched("same-origin", self, "enroll:8080"); code != http.StatusSeeOther {
-		t.Fatalf("a tunnel that rewrites the host still works: %d", code)
-	}
-	for _, site := range []string{"cross-site", "same-site", "none"} {
-		if code := a.fetched(site, self, host); code != http.StatusForbidden {
-			t.Fatalf("%s: %d", site, code)
-		}
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, origin+"/healthz", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("health answered %d", w.Code)
 	}
 }
 
-func TestOnlyAdminsApprove(t *testing.T) {
+func TestSigningOutEndsTheSessionHere(t *testing.T) {
 	a := newApp(t)
-	a.post("/devices", "budi@example.com", self, url.Values{"name": {"Phone"}})
-	device := a.only(t)
-	if w := a.get("/admin", "budi@example.com"); w.Code != http.StatusForbidden {
-		t.Fatalf("admin page: %d", w.Code)
+	session := signIn(t, a, "budi-code")
+	if w := a.post("/auth/signout", "https://evil.test", nil, session); w.Code != http.StatusForbidden {
+		t.Fatalf("a foreign form signed out: %d", w.Code)
 	}
-	if w := a.post("/admin/devices/"+device.ID+"/approve", "budi@example.com", self, nil); w.Code != http.StatusForbidden {
-		t.Fatalf("approve: %d", w.Code)
-	}
-	admin := body(a.get("/admin", "ADMIN@example.com"))
-	if !strings.Contains(admin, "budi@example.com") || !strings.Contains(admin, `<span class="name">Phone</span>`) {
-		t.Fatalf("admin page %s", admin)
-	}
-	if w := a.post("/admin/devices/"+device.ID+"/approve", "admin@example.com", self, nil); w.Code != http.StatusSeeOther {
-		t.Fatalf("approve: %d %s", w.Code, body(w))
-	}
-	approved := a.only(t)
-	page := body(a.get("/", "budi@example.com"))
-	if !strings.Contains(page, "https://dns.kleavox.xyz/dns-query/"+approved.ClientID) {
-		t.Fatalf("the owner sees the address: %s", page)
-	}
-	if strings.Contains(body(a.get("/", "sari@example.com")), approved.ClientID) {
-		t.Fatal("nobody else sees the address")
-	}
-}
-
-func TestOwnersRenewAndRemoveOnlyTheirOwn(t *testing.T) {
-	a := newApp(t)
-	a.post("/devices", "budi@example.com", self, url.Values{"name": {"Phone"}})
-	device := a.only(t)
-	a.post("/admin/devices/"+device.ID+"/approve", "admin@example.com", self, nil)
-	old := a.only(t).ClientID
-	if w := a.post("/devices/"+device.ID+"/renew", "sari@example.com", self, nil); w.Code != http.StatusNotFound {
-		t.Fatalf("someone else renews: %d", w.Code)
-	}
-	if w := a.post("/devices/"+device.ID+"/renew", "budi@example.com", self, nil); w.Code != http.StatusSeeOther {
-		t.Fatalf("renew: %d %s", w.Code, body(w))
-	}
-	if a.only(t).ClientID == old {
-		t.Fatal("a new address was not made")
-	}
-	if w := a.post("/devices/"+device.ID+"/remove", "budi@example.com", self, nil); w.Code != http.StatusSeeOther {
-		t.Fatalf("remove: %d", w.Code)
-	}
-	if state, _ := a.service.Store.Read(); len(state.Devices) != 0 {
-		t.Fatalf("state %#v", state)
-	}
-}
-
-func TestAProblemIsShownWithoutEchoingInput(t *testing.T) {
-	a := newApp(t)
-	w := a.post("/devices", "budi@example.com", self, url.Values{"name": {strings.Repeat("x", 41)}})
-	if w.Code != http.StatusBadRequest || !strings.Contains(body(w), "at most 40 characters") {
-		t.Fatalf("code %d", w.Code)
-	}
-	a.post("/devices", "budi@example.com", self, url.Values{"name": {`<script>alert(1)</script>`}})
-	page := body(a.get("/", "budi@example.com"))
-	if strings.Contains(page, "<script>alert") || !strings.Contains(page, "&lt;script&gt;") {
-		t.Fatal("a device name is escaped")
-	}
-}
-
-func TestEveryPageCarriesTheSecurityHeaders(t *testing.T) {
-	a := newApp(t)
-	w := a.get("/", "budi@example.com")
-	csp := w.Header().Get("Content-Security-Policy")
-	for _, want := range []string{"default-src 'none'", "script-src 'self'", "style-src 'self'", "frame-ancestors 'none'", "form-action 'self'"} {
-		if !strings.Contains(csp, want) {
-			t.Fatalf("csp %q is missing %q", csp, want)
-		}
-	}
-	if w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("X-Content-Type-Options") != "nosniff" || w.Header().Get("Referrer-Policy") != "no-referrer" {
-		t.Fatalf("headers %v", w.Header())
-	}
-	if regexp.MustCompile(`<script>[^<]`).MatchString(body(w)) {
-		t.Fatal("no inline script")
-	}
-	if script := a.get("/static/app.js", ""); script.Code != http.StatusOK || !strings.Contains(script.Header().Get("Content-Type"), "javascript") {
-		t.Fatalf("script %d %q", script.Code, script.Header().Get("Content-Type"))
+	w := a.post("/auth/signout", origin, nil, session)
+	cleared := cookie(t, w, "__Host-adns")
+	if cleared.MaxAge >= 0 && cleared.Value != "" {
+		t.Fatalf("cookie %#v", cleared)
 	}
 }
