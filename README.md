@@ -27,6 +27,18 @@ device would leave the list empty, the app puts `192.0.2.1` there instead, a
 documentation address no client can have (RFC 5737), so AdGuard keeps
 answering nobody. The next approved device takes its place.
 
+## What it reads from AdGuard
+
+The address is AdGuard's own: every page and card asks **Settings →
+Encryption settings** for the server name and the HTTPS port (`:port` is added
+unless it is 443), so a change there shows at once. With encryption off, or
+AdGuard not answering, no address is shown, only why; the ClientID still is.
+The Android Private DNS hostname, `<ClientID>.<server name>`, is offered only
+when DNS-over-TLS is on port 853 and the certificate covers `*.<server name>`
+(the name also needs a wildcard DNS record). The note that the person running
+the server can see the names looked up shows while AdGuard's query log is on,
+or when that setting cannot be read.
+
 ## How it runs
 
 One container, Go standard library only, pages rendered on the server. Data
@@ -43,7 +55,8 @@ The app also answers Pawl's card, `GET /.well-known/pawl/card`, so the cabinet
 shows the request's state: waiting, the DNS address and ClientID with Copy,
 or no access. **Detail** opens this app. Pawl only relays what the app writes.
 The card holds at most 70 characters per value; an address longer than that
-(a `DOH_HOST` over 19 characters) is left off the card and shown on the page.
+(a server name and port over 19 characters) is left off the card and shown on
+the page.
 
 ## Configuration
 
@@ -51,7 +64,6 @@ The card holds at most 70 characters per value; an address longer than that
 | --- | --- |
 | `ADGUARD_URL` | AdGuard Home base URL, e.g. `http://host.docker.internal:3000` |
 | `ADGUARD_USERNAME`, `ADGUARD_PASSWORD` | an AdGuard user for this app |
-| `DOH_HOST` | host shown in the address, e.g. `dns.example.com` |
 | `PAWL_ISSUER` | Pawl's address, e.g. `https://paw.example.com` |
 | `PAWL_CLIENT_ID`, `PAWL_CLIENT_SECRET` | from registering this app in Pawl |
 | `PUBLIC_ORIGIN` | this app's own address, e.g. `https://enroll.example.com` |
@@ -65,8 +77,8 @@ and the page shows the signed-in person their own subject to put there.
 Sessions are sealed with a key derived from the client secret, so a new secret
 signs everyone out.
 
-`ADMIN_EMAILS`, `ACCESS_TEAM` and `ACCESS_AUD` are no longer read; the log says
-so when they are still set.
+`ADMIN_EMAILS`, `ACCESS_TEAM`, `ACCESS_AUD` and, since 0.1.3, `DOH_HOST` are no
+longer read; the log says so, and why, when they are still set.
 
 ## Registering in Pawl
 
@@ -109,7 +121,7 @@ users:
 ```yaml
 services:
   enroll:
-    image: ghcr.io/kleavox/adns-enroll:0.1.2
+    image: ghcr.io/kleavox/adns-enroll:0.1.3
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
@@ -120,7 +132,6 @@ services:
       ADGUARD_URL: http://host.docker.internal:3000
       ADGUARD_USERNAME: enroll
       ADGUARD_PASSWORD: ${ADGUARD_PASSWORD}
-      DOH_HOST: dns.example.com
       PAWL_ISSUER: https://paw.example.com
       PAWL_CLIENT_ID: ${PAWL_CLIENT_ID}
       PAWL_CLIENT_SECRET: ${PAWL_CLIENT_SECRET}

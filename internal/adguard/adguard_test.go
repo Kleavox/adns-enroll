@@ -12,17 +12,21 @@ import (
 )
 
 type fake struct {
-	mu      sync.Mutex
-	clients []map[string]any
-	access  map[string]any
-	calls   []string
-	fail    string
+	mu       sync.Mutex
+	clients  []map[string]any
+	access   map[string]any
+	tls      map[string]any
+	querylog map[string]any
+	calls    []string
+	fail     string
 }
 
 func newFake() *fake {
 	return &fake{
-		clients: []map[string]any{{"name": "Laptop by hand", "ids": []any{"manual0123"}, "use_global_settings": false, "filtering_enabled": false, "upstreams": []any{"9.9.9.9"}}},
-		access:  map[string]any{"allowed_clients": []any{"100.64.0.0/10", "fd7a:115c:a1e0::/48", "manual0123"}, "disallowed_clients": []any{}, "blocked_hosts": []any{"version.bind"}},
+		clients:  []map[string]any{{"name": "Laptop by hand", "ids": []any{"manual0123"}, "use_global_settings": false, "filtering_enabled": false, "upstreams": []any{"9.9.9.9"}}},
+		access:   map[string]any{"allowed_clients": []any{"100.64.0.0/10", "fd7a:115c:a1e0::/48", "manual0123"}, "disallowed_clients": []any{}, "blocked_hosts": []any{"version.bind"}},
+		tls:      map[string]any{"enabled": true, "server_name": "resolver.example.test", "force_https": true, "port_https": 443, "port_dns_over_tls": 853, "port_dns_over_quic": 853, "dns_names": []any{"resolver.example.test", "*.resolver.example.test"}, "private_key_saved": true, "valid_pair": true},
+		querylog: map[string]any{"enabled": true, "interval": 7776000000, "anonymize_client_ip": false, "ignored": []any{}},
 	}
 }
 
@@ -64,6 +68,10 @@ func (f *fake) server(t *testing.T) *Client {
 			json.NewEncoder(w).Encode(f.access)
 		case "/control/access/set":
 			f.access = body
+		case "/control/tls/status":
+			json.NewEncoder(w).Encode(f.tls)
+		case "/control/querylog/config":
+			json.NewEncoder(w).Encode(f.querylog)
 		default:
 			http.NotFound(w, r)
 		}
@@ -189,6 +197,81 @@ func TestDeletingAClientAndListingClients(t *testing.T) {
 	}
 	if f.client("Phone") != nil {
 		t.Fatal("the client is still there")
+	}
+}
+
+func TestTheAddressesComeFromAdGuardsEncryptionSettings(t *testing.T) {
+	f := newFake()
+	api := f.server(t)
+	const id = "0123456789abcdef0123456789abcdef"
+	encryption, err := api.Encryption(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := encryption.DoH(id); got != "https://resolver.example.test/dns-query/"+id {
+		t.Fatalf("DoH %q", got)
+	}
+	if got := encryption.PrivateDNS(id); got != id+".resolver.example.test" {
+		t.Fatalf("private DNS %q", got)
+	}
+	f.tls["server_name"] = "other.example.test"
+	f.tls["port_https"] = 8443
+	encryption, _ = api.Encryption(context.Background())
+	if got := encryption.DoH(id); got != "https://other.example.test:8443/dns-query/"+id {
+		t.Fatalf("DoH %q", got)
+	}
+	if got := encryption.PrivateDNS(id); got != "" {
+		t.Fatalf("a certificate for another name offers no private DNS: %q", got)
+	}
+}
+
+func TestNoAddressIsMadeForWhatAdGuardDoesNotServe(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef"
+	served := Encryption{Enabled: true, ServerName: "Resolver.Example.Test", PortHTTPS: 443, PortDoT: 853, DNSNames: []string{"*.resolver.example.test"}}
+	if served.PrivateDNS(id) != id+".resolver.example.test" {
+		t.Fatalf("names are compared without case: %q", served.PrivateDNS(id))
+	}
+	for name, encryption := range map[string]Encryption{
+		"encryption off": {ServerName: "resolver.example.test", PortHTTPS: 443, PortDoT: 853, DNSNames: []string{"*.resolver.example.test"}},
+		"no server name": {Enabled: true, PortHTTPS: 443, PortDoT: 853},
+	} {
+		if encryption.DoH(id) != "" || encryption.PrivateDNS(id) != "" {
+			t.Errorf("%s: %q %q", name, encryption.DoH(id), encryption.PrivateDNS(id))
+		}
+	}
+	noHTTPS := served
+	noHTTPS.PortHTTPS = 0
+	if noHTTPS.DoH(id) != "" {
+		t.Errorf("HTTPS port 0: %q", noHTTPS.DoH(id))
+	}
+	for name, change := range map[string]func(*Encryption){
+		"DoT off":               func(e *Encryption) { e.PortDoT = 0 },
+		"DoT not on 853":        func(e *Encryption) { e.PortDoT = 8853 },
+		"no wildcard":           func(e *Encryption) { e.DNSNames = []string{"resolver.example.test"} },
+		"a deeper wildcard":     func(e *Encryption) { e.DNSNames = []string{"*.sub.resolver.example.test"} },
+		"the parent's wildcard": func(e *Encryption) { e.DNSNames = []string{"*.example.test"} },
+	} {
+		encryption := served
+		change(&encryption)
+		if got := encryption.PrivateDNS(id); got != "" {
+			t.Errorf("%s: %q", name, got)
+		}
+	}
+}
+
+func TestTheQueryLogSettingIsRead(t *testing.T) {
+	f := newFake()
+	api := f.server(t)
+	if logged, err := api.QueryLog(context.Background()); err != nil || !logged {
+		t.Fatalf("logged %v %v", logged, err)
+	}
+	f.querylog["enabled"] = false
+	if logged, err := api.QueryLog(context.Background()); err != nil || logged {
+		t.Fatalf("logged %v %v", logged, err)
+	}
+	f.fail = "/control/querylog/config"
+	if _, err := api.QueryLog(context.Background()); err == nil {
+		t.Fatal("a failure is reported")
 	}
 }
 

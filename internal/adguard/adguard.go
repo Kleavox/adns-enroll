@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -153,6 +155,54 @@ func (c *Client) Allow(ctx context.Context, id string) error {
 	}
 	list["allowed_clients"] = append(slices.DeleteFunc(allowed, func(item string) bool { return item == nobody }), id)
 	return c.call(ctx, http.MethodPost, "access/set", list, nil)
+}
+
+type Encryption struct {
+	Enabled    bool     `json:"enabled"`
+	ServerName string   `json:"server_name"`
+	PortHTTPS  int      `json:"port_https"`
+	PortDoT    int      `json:"port_dns_over_tls"`
+	DNSNames   []string `json:"dns_names"`
+}
+
+func (c *Client) Encryption(ctx context.Context) (Encryption, error) {
+	var encryption Encryption
+	err := c.call(ctx, http.MethodGet, "tls/status", nil, &encryption)
+	return encryption, err
+}
+
+func (e Encryption) server() string {
+	if !e.Enabled {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(e.ServerName))
+}
+
+func (e Encryption) DoH(id string) string {
+	host := e.server()
+	if host == "" || e.PortHTTPS == 0 {
+		return ""
+	}
+	if e.PortHTTPS != 443 {
+		host = net.JoinHostPort(host, strconv.Itoa(e.PortHTTPS))
+	}
+	return "https://" + host + "/dns-query/" + id
+}
+
+func (e Encryption) PrivateDNS(id string) string {
+	host := e.server()
+	if host == "" || e.PortDoT != 853 || !slices.ContainsFunc(e.DNSNames, func(name string) bool { return strings.EqualFold(name, "*."+host) }) {
+		return ""
+	}
+	return id + "." + host
+}
+
+func (c *Client) QueryLog(ctx context.Context) (bool, error) {
+	var config struct {
+		Enabled bool `json:"enabled"`
+	}
+	err := c.call(ctx, http.MethodGet, "querylog/config", nil, &config)
+	return config.Enabled, err
 }
 
 func (c *Client) Disallow(ctx context.Context, ids ...string) error {

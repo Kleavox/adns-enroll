@@ -74,14 +74,15 @@ func run() error {
 	if _, err := saved.Read(); err != nil {
 		return fmt.Errorf("read %s: %w", store.File, err)
 	}
-	service := &enroll.Service{Store: saved, DNS: adguard.New(c.AdGuardURL, c.AdGuardUser, c.AdGuardPassword, nil), Now: time.Now}
+	dns := adguard.New(c.AdGuardURL, c.AdGuardUser, c.AdGuardPassword, nil)
+	service := &enroll.Service{Store: saved, DNS: dns, Now: time.Now}
 	if err := service.Migrate(); err != nil {
 		return fmt.Errorf("move devices to accounts: %w", err)
 	}
-	for _, old := range c.Retired {
-		log.Printf("%s is no longer read; sign-in goes through Pawl", old)
+	for _, note := range c.Retired {
+		log.Print(note)
 	}
-	server := &web.Server{Service: service, Admins: c.Admins, DoHHost: c.DoHHost, Origin: c.Origin, Missing: c.signInMissing(), Log: log.Printf, Now: time.Now}
+	server := &web.Server{Service: service, AdGuard: dns, Admins: c.Admins, Origin: c.Origin, Missing: c.signInMissing(), Log: log.Printf, Now: time.Now}
 	var provider *pawl.Provider
 	if server.Missing == "" {
 		provider = pawl.New(c.Issuer, c.ClientID, c.ClientSecret, c.Origin+"/auth/callback")

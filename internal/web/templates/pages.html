@@ -34,8 +34,9 @@
 <code>{{.Address}}</code>
 <button type="button" data-copy="{{.Address}}">Copy</button>
 </div>
-<p class="hint">Client ID <code>{{.ClientID}}</code> <button type="button" data-copy="{{.ClientID}}">Copy</button></p>
 {{end}}
+{{if .Unavailable}}<p class="note">{{.Unavailable}}</p>{{end}}
+{{if .ClientID}}<p class="hint">Client ID <code>{{.ClientID}}</code> <button type="button" data-copy="{{.ClientID}}">Copy</button></p>{{end}}
 {{end}}
 
 {{define "setup"}}
@@ -44,10 +45,11 @@
 <ul>
 <li><strong>Chrome, Edge</strong>: Settings, Privacy and security, Security, Use secure DNS, custom; paste the address.</li>
 <li><strong>Firefox</strong>: Settings, Privacy &amp; Security, DNS over HTTPS, Max Protection, custom; paste the address.</li>
-<li><strong>Phones</strong>: use a browser or an app that takes a DNS-over-HTTPS address. Android's Private DNS needs a different kind of address, which this server does not offer.</li>
+{{if .PrivateDNS}}<li><strong>Android 9 or newer</strong>: Settings, Network &amp; internet, Private DNS, Private DNS provider hostname; enter <code>{{.PrivateDNS}}</code> <button type="button" data-copy="{{.PrivateDNS}}">Copy</button></li>{{end}}
+<li><strong>Phones</strong>: use a browser or an app that takes a DNS-over-HTTPS address.{{if not .PrivateDNS}} Android's Private DNS needs a DNS-over-TLS address, which this server does not offer.{{end}}</li>
 </ul>
 <p class="note">Every device of yours uses this one address. Lost a device or shared the address by mistake? Ask the admin for a new one.</p>
-<p class="note">The person who runs this server can see the names your devices look up.</p>
+{{if .LogNote}}<p class="note">The person who runs this server can see the names your devices look up.</p>{{end}}
 </section>
 {{end}}
 
@@ -56,7 +58,7 @@
 <h1>Your DNS address</h1>
 {{template "own" .}}
 <p>Need a new address? Ask the admin.</p>
-{{template "setup" .}}
+{{if .Address}}{{template "setup" .}}{{end}}
 {{else if eq .Status "denied"}}
 <h1>No access</h1>
 <p>The admin has not given you access. Ask them if this is a mistake.</p>
@@ -68,7 +70,7 @@
 {{end}}
 
 {{define "admin"}}
-{{if .Address}}<h1>Your DNS address</h1>{{template "own" .}}{{end}}
+{{if .ClientID}}<h1>Your DNS address</h1>{{template "own" .}}{{end}}
 <h1>Requests</h1>
 {{if not .Waiting}}<p class="empty">No requests waiting.</p>{{end}}
 <ul class="list">

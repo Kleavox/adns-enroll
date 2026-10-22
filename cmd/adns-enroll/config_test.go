@@ -16,7 +16,6 @@ var full = map[string]string{
 	"ADGUARD_URL":        "http://host.docker.internal:3000",
 	"ADGUARD_USERNAME":   "enroll",
 	"ADGUARD_PASSWORD":   "secret",
-	"DOH_HOST":           "dns.kleavox.xyz",
 	"ADMIN_SUBJECTS":     " Pairwise-Owner_1 , other-sub ,",
 	"PAWL_ISSUER":        "https://paw.kleavox.xyz/",
 	"PAWL_CLIENT_ID":     "dns",
@@ -29,7 +28,7 @@ func TestAFullConfigurationIsRead(t *testing.T) {
 	if len(missing) != 0 {
 		t.Fatalf("missing %v", missing)
 	}
-	if config.DataDir != "/data" || config.Listen != ":8080" || config.DoHHost != "dns.kleavox.xyz" ||
+	if config.DataDir != "/data" || config.Listen != ":8080" || len(config.Retired) != 0 ||
 		!slices.Equal(config.Admins, []string{"Pairwise-Owner_1", "other-sub"}) ||
 		config.Issuer != "https://paw.kleavox.xyz" || config.Origin != "https://enroll.kleavox.xyz" || config.signInMissing() != "" {
 		t.Fatalf("config %#v", config)
@@ -38,7 +37,7 @@ func TestAFullConfigurationIsRead(t *testing.T) {
 
 func TestMissingValuesAreNamedNeverShown(t *testing.T) {
 	_, missing := load(env(map[string]string{"ADGUARD_PASSWORD": "secret"}))
-	want := []string{"ADGUARD_URL", "ADGUARD_USERNAME", "DOH_HOST"}
+	want := []string{"ADGUARD_URL", "ADGUARD_USERNAME"}
 	if !slices.Equal(missing, want) {
 		t.Fatalf("missing %v", missing)
 	}
@@ -61,13 +60,22 @@ func TestWithoutPawlSettingsTheAppStartsAndSaysWhatIsMissing(t *testing.T) {
 	}
 }
 
-func TestSettingsFromBeforePawlAreNamedAsNoLongerRead(t *testing.T) {
+func TestSettingsNoLongerReadAreNamedWithWhereTheyComeFromNow(t *testing.T) {
 	old := maps.Clone(full)
 	old["ADMIN_EMAILS"] = "a@b.c"
 	old["ACCESS_AUD"] = "aud"
-	config, _ := load(env(old))
-	if !slices.Equal(config.Retired, []string{"ADMIN_EMAILS", "ACCESS_AUD"}) {
-		t.Fatalf("retired %v", config.Retired)
+	old["DOH_HOST"] = "dns.kleavox.xyz"
+	config, missing := load(env(old))
+	if len(missing) != 0 || len(config.Retired) != 3 {
+		t.Fatalf("missing %v retired %q", missing, config.Retired)
+	}
+	for index, name := range []string{"ADMIN_EMAILS", "ACCESS_AUD", "DOH_HOST"} {
+		if !strings.HasPrefix(config.Retired[index], name+" is no longer read; ") {
+			t.Errorf("retired %q", config.Retired[index])
+		}
+	}
+	if !strings.Contains(config.Retired[1], "Pawl") || !strings.Contains(config.Retired[2], "AdGuard's encryption settings") || strings.Contains(strings.Join(config.Retired, " "), "dns.kleavox.xyz") {
+		t.Fatalf("retired %q", config.Retired)
 	}
 }
 

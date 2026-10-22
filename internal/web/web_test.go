@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -54,6 +55,19 @@ func (q *quiet) Disallow(_ context.Context, ids ...string) error {
 	return nil
 }
 
+type settings struct {
+	encryption adguard.Encryption
+	logged     bool
+	err        error
+	logErr     error
+}
+
+func (s *settings) Encryption(context.Context) (adguard.Encryption, error) {
+	return s.encryption, s.err
+}
+
+func (s *settings) QueryLog(context.Context) (bool, error) { return s.logged, s.logErr }
+
 type fakePawl struct {
 	people    map[string]pawl.Person
 	exchanged []string
@@ -89,6 +103,7 @@ type app struct {
 	handler http.Handler
 	service *enroll.Service
 	dns     *quiet
+	adguard *settings
 	pawl    *fakePawl
 }
 
@@ -105,17 +120,30 @@ func newApp(t *testing.T, admins ...string) app {
 		"owner-code": owner, "budi-code": budi,
 		"card:owner-card": owner, "card:budi-card": budi,
 	}}
+	read := &settings{
+		encryption: adguard.Encryption{Enabled: true, ServerName: "dns.example.test", PortHTTPS: 443, PortDoT: 853, DNSNames: []string{"dns.example.test"}},
+		logged:     true,
+	}
 	server := &Server{
 		Service: service,
+		AdGuard: read,
 		Pawl:    fake,
 		Admins:  admins,
-		DoHHost: "dns.example.test",
 		Origin:  origin,
 		Key:     []byte("a session key for the tests only"),
 		Log:     func(string, ...any) {},
 		Now:     func() time.Time { return now },
 	}
-	return app{handler: server.Handler(), service: service, dns: dns, pawl: fake}
+	return app{handler: server.Handler(), service: service, dns: dns, adguard: read, pawl: fake}
+}
+
+func approved(t *testing.T, a app, person pawl.Person) (*http.Cookie, string) {
+	t.Helper()
+	session := signIn(t, a, strings.TrimPrefix(person.Sub, "pairwise-")+"-code")
+	if err := a.service.Approve(context.Background(), account(t, a, person.Sub).ID); err != nil {
+		t.Fatal(err)
+	}
+	return session, account(t, a, person.Sub).ClientIDs[0]
 }
 
 func (a app) do(r *http.Request) *httptest.ResponseRecorder {
@@ -430,10 +458,79 @@ func TestTheCardThanksANewcomerAndHoldsThemUntilApproved(t *testing.T) {
 	}
 }
 
+func TestTheAddressFollowsAdGuardsServerName(t *testing.T) {
+	a := newApp(t, owner.Sub)
+	session, id := approved(t, a, budi)
+	a.adguard.encryption.ServerName = "doh.example.test"
+	page := text(a.get("/", session))
+	if !strings.Contains(page, "https://doh.example.test/dns-query/"+id) || strings.Contains(page, "dns.example.test") {
+		t.Fatalf("page %s", page)
+	}
+	_, card := a.card(t, "budi-card")
+	if len(card.Fields) != 2 || card.Fields[0].Value != "https://doh.example.test/dns-query/"+id {
+		t.Fatalf("card %#v", card)
+	}
+}
+
+func TestWithoutAnAddressFromAdGuardNoneIsGuessed(t *testing.T) {
+	a := newApp(t, owner.Sub)
+	session, id := approved(t, a, budi)
+	for _, broken := range []struct {
+		name  string
+		cause func()
+		says  string
+	}{
+		{"AdGuard is silent", func() { a.adguard.err = errors.New("adguard tls/status answered 502") }, "AdGuard is not answering"},
+		{"encryption is off", func() { a.adguard.err, a.adguard.encryption.Enabled = nil, false }, "AdGuard has no encrypted DNS turned on"},
+	} {
+		broken.cause()
+		page := text(a.get("/", session))
+		if strings.Contains(page, "dns-query") || !strings.Contains(page, id) || !strings.Contains(page, broken.says) || strings.Contains(page, "Set it up") {
+			t.Errorf("%s: page %s", broken.name, page)
+		}
+		status, card := a.card(t, "budi-card")
+		withinPawlsLimits(t, card)
+		if status != http.StatusOK || len(card.Fields) != 1 || card.Fields[0].Value != id || !strings.Contains(card.Message, broken.says) {
+			t.Errorf("%s: card %d %#v", broken.name, status, card)
+		}
+	}
+}
+
+func TestAndroidIsOfferedOnlyWhenAdGuardServesIt(t *testing.T) {
+	a := newApp(t, owner.Sub)
+	session, id := approved(t, a, budi)
+	page := text(a.get("/", session))
+	if strings.Contains(page, id+".dns.example.test") || !strings.Contains(page, "does not offer") {
+		t.Fatalf("page %s", page)
+	}
+	a.adguard.encryption.DNSNames = []string{"dns.example.test", "*.dns.example.test"}
+	page = text(a.get("/", session))
+	if !strings.Contains(page, id+".dns.example.test") || strings.Contains(page, "does not offer") {
+		t.Fatalf("page %s", page)
+	}
+}
+
+func TestTheLookupNoteFollowsTheQueryLog(t *testing.T) {
+	a := newApp(t, owner.Sub)
+	session, _ := approved(t, a, budi)
+	const note = "can see the names your devices look up"
+	if page := text(a.get("/", session)); !strings.Contains(page, note) {
+		t.Fatalf("logged, page %s", page)
+	}
+	a.adguard.logged = false
+	if page := text(a.get("/", session)); strings.Contains(page, note) {
+		t.Fatalf("not logged, page %s", page)
+	}
+	a.adguard.logErr = errors.New("adguard querylog/config answered 502")
+	if page := text(a.get("/", session)); !strings.Contains(page, note) {
+		t.Fatalf("unknown, page %s", page)
+	}
+}
+
 func TestAnAddressTooLongForTheCardIsLeftToDetail(t *testing.T) {
-	server := &Server{DoHHost: "resolver.a-rather-long-private-dns-name.example.test", Origin: origin}
+	server := &Server{Origin: origin}
 	account := store.Account{Status: store.Approved, ClientIDs: []string{"0123456789abcdef0123456789abcdef"}}
-	raw, _ := json.Marshal(server.cardFor(account))
+	raw, _ := json.Marshal(server.cardFor(account, addresses{DoH: "https://resolver.a-rather-long-private-dns-name.example.test/dns-query/0123456789abcdef0123456789abcdef"}))
 	var card answer
 	if err := json.Unmarshal(raw, &card); err != nil {
 		t.Fatal(err)

@@ -6,11 +6,17 @@ import (
 	"strings"
 )
 
+var retired = []struct{ name, why string }{
+	{"ADMIN_EMAILS", "sign-in goes through Pawl"},
+	{"ACCESS_TEAM", "sign-in goes through Pawl"},
+	{"ACCESS_AUD", "sign-in goes through Pawl"},
+	{"DOH_HOST", "the address comes from AdGuard's encryption settings"},
+}
+
 type config struct {
 	AdGuardURL      string
 	AdGuardUser     string
 	AdGuardPassword string
-	DoHHost         string
 	Admins          []string
 	Issuer          string
 	ClientID        string
@@ -27,7 +33,6 @@ func load(getenv func(string) string) (config, []string) {
 		AdGuardURL:      value("ADGUARD_URL"),
 		AdGuardUser:     value("ADGUARD_USERNAME"),
 		AdGuardPassword: getenv("ADGUARD_PASSWORD"),
-		DoHHost:         value("DOH_HOST"),
 		Issuer:          strings.TrimSuffix(value("PAWL_ISSUER"), "/"),
 		ClientID:        value("PAWL_CLIENT_ID"),
 		ClientSecret:    getenv("PAWL_CLIENT_SECRET"),
@@ -40,9 +45,9 @@ func load(getenv func(string) string) (config, []string) {
 			c.Admins = append(c.Admins, admin)
 		}
 	}
-	for _, old := range []string{"ADMIN_EMAILS", "ACCESS_TEAM", "ACCESS_AUD"} {
-		if value(old) != "" {
-			c.Retired = append(c.Retired, old)
+	for _, old := range retired {
+		if value(old.name) != "" {
+			c.Retired = append(c.Retired, old.name+" is no longer read; "+old.why)
 		}
 	}
 	if c.DataDir == "" {
@@ -59,7 +64,6 @@ func load(getenv func(string) string) (config, []string) {
 		{"ADGUARD_URL", c.AdGuardURL != ""},
 		{"ADGUARD_USERNAME", c.AdGuardUser != ""},
 		{"ADGUARD_PASSWORD", c.AdGuardPassword != ""},
-		{"DOH_HOST", c.DoHHost != ""},
 	} {
 		if !required.set {
 			missing = append(missing, required.name)

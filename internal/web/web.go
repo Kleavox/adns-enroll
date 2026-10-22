@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Kleavox/adns-enroll/internal/adguard"
 	"github.com/Kleavox/adns-enroll/internal/enroll"
 	"github.com/Kleavox/adns-enroll/internal/pawl"
 	"github.com/Kleavox/adns-enroll/internal/store"
@@ -35,11 +36,16 @@ type Pawl interface {
 	Card(ctx context.Context, token string) (pawl.Person, error)
 }
 
+type AdGuard interface {
+	Encryption(ctx context.Context) (adguard.Encryption, error)
+	QueryLog(ctx context.Context) (bool, error)
+}
+
 type Server struct {
 	Service *enroll.Service
+	AdGuard AdGuard
 	Pawl    Pawl
 	Admins  []string
-	DoHHost string
 	Origin  string
 	Key     []byte
 	Missing string
@@ -66,21 +72,24 @@ type row struct {
 }
 
 type page struct {
-	Template string
-	Email    string
-	Admin    bool
-	Status   string
-	Address  string
-	ClientID string
-	Sub      string
-	NoAdmin  bool
-	Notice   string
-	Problem  string
-	Heading  string
-	Message  string
-	Waiting  []row
-	Accounts []row
-	Denied   []row
+	Template    string
+	Email       string
+	Admin       bool
+	Status      string
+	Address     string
+	PrivateDNS  string
+	Unavailable string
+	ClientID    string
+	LogNote     bool
+	Sub         string
+	NoAdmin     bool
+	Notice      string
+	Problem     string
+	Heading     string
+	Message     string
+	Waiting     []row
+	Accounts    []row
+	Denied      []row
 }
 
 func (s *Server) Handler() http.Handler {
@@ -234,11 +243,41 @@ func (s *Server) signout(w http.ResponseWriter, r *http.Request) {
 	s.message(w, http.StatusOK, "Signed out of Private DNS", "Your Pawl session stays as it is.")
 }
 
-func (s *Server) address(account store.Account) string {
+const (
+	notAnswering = "AdGuard is not answering, so your address cannot be shown right now."
+	noEncryption = "AdGuard has no encrypted DNS turned on, so there is no address to use yet."
+)
+
+type addresses struct {
+	DoH        string
+	PrivateDNS string
+	Problem    string
+}
+
+func (s *Server) addressesFor(ctx context.Context, account store.Account) addresses {
 	if account.Status != store.Approved || len(account.ClientIDs) == 0 {
-		return ""
+		return addresses{}
 	}
-	return "https://" + s.DoHHost + "/dns-query/" + account.ClientIDs[0]
+	encryption, err := s.AdGuard.Encryption(ctx)
+	if err != nil {
+		s.Log("read AdGuard's encryption settings: %v", err)
+		return addresses{Problem: notAnswering}
+	}
+	id := account.ClientIDs[0]
+	found := addresses{DoH: encryption.DoH(id), PrivateDNS: encryption.PrivateDNS(id)}
+	if found.DoH == "" {
+		found.Problem = noEncryption
+	}
+	return found
+}
+
+func (s *Server) lookupsLogged(ctx context.Context) bool {
+	logged, err := s.AdGuard.QueryLog(ctx)
+	if err != nil {
+		s.Log("read AdGuard's query log setting: %v", err)
+		return true
+	}
+	return logged
 }
 
 func label(account store.Account) string {
@@ -264,10 +303,14 @@ func (s *Server) homePage(r *http.Request, who sealed) (page, error) {
 	for _, account := range state.Accounts {
 		if account.Sub == who.Sub {
 			data.Status = string(account.Status)
-			if address := s.address(account); address != "" {
-				data.Address, data.ClientID = address, account.ClientIDs[0]
+			if account.Status == store.Approved && len(account.ClientIDs) > 0 {
+				found := s.addressesFor(r.Context(), account)
+				data.Address, data.PrivateDNS, data.Unavailable, data.ClientID = found.DoH, found.PrivateDNS, found.Problem, account.ClientIDs[0]
 			}
 		}
+	}
+	if data.Address != "" && !data.Admin {
+		data.LogNote = s.lookupsLogged(r.Context())
 	}
 	if data.Admin {
 		data.Template = "admin"
@@ -372,16 +415,20 @@ type cardAction struct {
 	Href  string `json:"href"`
 }
 
-func (s *Server) cardFor(account store.Account) card {
+func (s *Server) cardFor(account store.Account, found addresses) card {
 	switch account.Status {
 	case store.Approved:
 		fields := []cardField{{Label: "Client ID", Value: account.ClientIDs[0], Copy: true}}
-		if address := s.address(account); utf8.RuneCountInString(address) <= cardValueLimit {
+		if address := found.DoH; address != "" && utf8.RuneCountInString(address) <= cardValueLimit {
 			fields = append([]cardField{{Label: "DNS address", Value: address, Copy: true}}, fields...)
+		}
+		message := "Use it as the DNS-over-HTTPS address on your devices."
+		if found.Problem != "" {
+			message = found.Problem
 		}
 		return card{
 			Title:   "Your DNS address",
-			Message: "Use it as the DNS-over-HTTPS address on your devices.",
+			Message: message,
 			Fields:  fields,
 			Action:  &cardAction{Label: "Detail", Href: s.Origin + "/"},
 		}
@@ -412,5 +459,5 @@ func (s *Server) card(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"error":"unavailable"}`))
 		return
 	}
-	json.NewEncoder(w).Encode(s.cardFor(account))
+	json.NewEncoder(w).Encode(s.cardFor(account, s.addressesFor(r.Context(), account)))
 }
