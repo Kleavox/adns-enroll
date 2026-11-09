@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"maps"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func env(values map[string]string) func(string) string {
@@ -90,5 +92,67 @@ func TestTheSessionKeyComesFromTheSecretWithoutBeingIt(t *testing.T) {
 	again, _ := load(env(changed))
 	if bytes.Equal(again.sessionKey(), key) {
 		t.Fatal("a new secret keeps the old sessions")
+	}
+}
+
+func TestWithoutASessionKeyTheOldDerivationFromTheSecretStaysByteForByte(t *testing.T) {
+	changed := maps.Clone(full)
+	changed["PAWL_CLIENT_SECRET"] = "client-secret"
+	config, _ := load(env(changed))
+	if got := hex.EncodeToString(config.sessionKey()); got != "a2ec5b41b0fc6b51d8ec2a8b28ef70d860c9e16654371abb7f9847e51466656c" {
+		t.Fatalf("key %s", got)
+	}
+	if !config.sessionTiedToSecret() {
+		t.Fatal("sessions are tied to the secret and the app says so")
+	}
+}
+
+func TestASessionKeySurvivesANewClientSecret(t *testing.T) {
+	keyed := maps.Clone(full)
+	keyed["SESSION_KEY"] = " a long random value that the operator chose for sessions "
+	config, _ := load(env(keyed))
+	key := config.sessionKey()
+	secretKey := func() []byte { c, _ := load(env(full)); return c.sessionKey() }()
+	if len(key) != 32 || bytes.Equal(key, secretKey) || bytes.Contains(key, []byte("a long random value")) || config.sessionTiedToSecret() || len(config.Problems) != 0 {
+		t.Fatalf("key %x problems %q", key, config.Problems)
+	}
+	keyed["PAWL_CLIENT_SECRET"] = "rotated"
+	again, _ := load(env(keyed))
+	if !bytes.Equal(again.sessionKey(), key) {
+		t.Fatal("a new client secret signed everyone out")
+	}
+	keyed["SESSION_KEY"] = "another long random value that the operator chose later"
+	other, _ := load(env(keyed))
+	if bytes.Equal(other.sessionKey(), key) {
+		t.Fatal("a new session key keeps the old sessions")
+	}
+}
+
+func TestAShortSessionKeyIsAProblemNamedNeverShown(t *testing.T) {
+	short := maps.Clone(full)
+	short["SESSION_KEY"] = "too short"
+	config, missing := load(env(short))
+	if len(missing) != 0 || len(config.Problems) != 1 || !strings.HasPrefix(config.Problems[0], "SESSION_KEY") || strings.Contains(config.Problems[0], "too short") {
+		t.Fatalf("missing %v problems %q", missing, config.Problems)
+	}
+}
+
+func TestTheCardsAdGuardLimitHasADefaultBelowPawlsAndMustBeADuration(t *testing.T) {
+	config, _ := load(env(full))
+	if config.CardTimeout != 4*time.Second || len(config.Problems) != 0 {
+		t.Fatalf("timeout %v problems %q", config.CardTimeout, config.Problems)
+	}
+	set := maps.Clone(full)
+	set["CARD_ADGUARD_TIMEOUT"] = "1500ms"
+	config, _ = load(env(set))
+	if config.CardTimeout != 1500*time.Millisecond || len(config.Problems) != 0 {
+		t.Fatalf("timeout %v problems %q", config.CardTimeout, config.Problems)
+	}
+	for _, bad := range []string{"soon", "0s", "-3s", "4"} {
+		set["CARD_ADGUARD_TIMEOUT"] = bad
+		config, _ = load(env(set))
+		if len(config.Problems) != 1 || !strings.HasPrefix(config.Problems[0], "CARD_ADGUARD_TIMEOUT") {
+			t.Errorf("%q: problems %q", bad, config.Problems)
+		}
 	}
 }

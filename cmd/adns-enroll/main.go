@@ -67,6 +67,9 @@ func run() error {
 	if len(missing) > 0 {
 		return fmt.Errorf("set %s", strings.Join(missing, ", "))
 	}
+	if len(c.Problems) > 0 {
+		return fmt.Errorf("fix %s", strings.Join(c.Problems, "; "))
+	}
 	saved, err := store.Open(c.DataDir)
 	if err != nil {
 		return err
@@ -82,7 +85,10 @@ func run() error {
 	for _, note := range c.Retired {
 		log.Print(note)
 	}
-	server := &web.Server{Service: service, AdGuard: dns, Admins: c.Admins, Origin: c.Origin, Missing: c.signInMissing(), Log: log.Printf, Now: time.Now}
+	if c.sessionTiedToSecret() {
+		log.Print("sessions are tied to PAWL_CLIENT_SECRET; set SESSION_KEY so a new secret does not sign everyone out")
+	}
+	server := &web.Server{Service: service, AdGuard: dns, Admins: c.Admins, Origin: c.Origin, Missing: c.signInMissing(), Log: log.Printf, Now: time.Now, CardTimeout: c.CardTimeout}
 	var provider *pawl.Provider
 	if server.Missing == "" {
 		provider = pawl.New(c.Issuer, c.ClientID, c.ClientSecret, c.Origin+"/auth/callback")

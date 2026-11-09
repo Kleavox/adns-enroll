@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -60,9 +61,14 @@ type settings struct {
 	logged     bool
 	err        error
 	logErr     error
+	hold       bool
 }
 
-func (s *settings) Encryption(context.Context) (adguard.Encryption, error) {
+func (s *settings) Encryption(ctx context.Context) (adguard.Encryption, error) {
+	if s.hold {
+		<-ctx.Done()
+		return adguard.Encryption{}, ctx.Err()
+	}
 	return s.encryption, s.err
 }
 
@@ -89,7 +95,7 @@ func (f *fakePawl) Exchange(_ context.Context, code, verifier, nonce string) (pa
 func (f *fakePawl) Card(_ context.Context, token string) (pawl.Person, error) {
 	person, found := f.people["card:"+token]
 	if !found {
-		return pawl.Person{}, pawl.ErrDenied
+		return pawl.Person{}, pawl.Refusal{Reason: "bad signature"}
 	}
 	return person, nil
 }
@@ -105,6 +111,7 @@ type app struct {
 	dns     *quiet
 	adguard *settings
 	pawl    *fakePawl
+	logs    *[]string
 }
 
 func newApp(t *testing.T, admins ...string) app {
@@ -124,17 +131,19 @@ func newApp(t *testing.T, admins ...string) app {
 		encryption: adguard.Encryption{Enabled: true, ServerName: "dns.example.test", PortHTTPS: 443, PortDoT: 853, DNSNames: []string{"dns.example.test"}},
 		logged:     true,
 	}
+	logs := &[]string{}
 	server := &Server{
-		Service: service,
-		AdGuard: read,
-		Pawl:    fake,
-		Admins:  admins,
-		Origin:  origin,
-		Key:     []byte("a session key for the tests only"),
-		Log:     func(string, ...any) {},
-		Now:     func() time.Time { return now },
+		Service:     service,
+		AdGuard:     read,
+		Pawl:        fake,
+		Admins:      admins,
+		Origin:      origin,
+		Key:         []byte("a session key for the tests only"),
+		CardTimeout: 200 * time.Millisecond,
+		Log:         func(format string, args ...any) { *logs = append(*logs, fmt.Sprintf(format, args...)) },
+		Now:         func() time.Time { return now },
 	}
-	return app{handler: server.Handler(), service: service, dns: dns, adguard: read, pawl: fake}
+	return app{handler: server.Handler(), service: service, dns: dns, adguard: read, pawl: fake, logs: logs}
 }
 
 func approved(t *testing.T, a app, person pawl.Person) (*http.Cookie, string) {
@@ -455,6 +464,36 @@ func TestTheCardThanksANewcomerAndHoldsThemUntilApproved(t *testing.T) {
 	withinPawlsLimits(t, card)
 	if card.Title != "No access" || len(card.Fields) != 0 {
 		t.Fatalf("card %#v", card)
+	}
+}
+
+func TestARefusedCardTokenIsLoggedWithItsReasonAndNeverItself(t *testing.T) {
+	a := newApp(t, owner.Sub)
+	if status, _ := a.card(t, "forged-token-value"); status != http.StatusUnauthorized {
+		t.Fatalf("answered %d", status)
+	}
+	joined := strings.Join(*a.logs, "\n")
+	if !strings.Contains(joined, "card token refused: bad signature") || strings.Contains(joined, "forged-token-value") {
+		t.Fatalf("log %q", joined)
+	}
+	*a.logs = nil
+	if status, _ := a.card(t, ""); status != http.StatusUnauthorized || len(*a.logs) != 0 {
+		t.Fatalf("a request with no token answered %d and logged %q", status, *a.logs)
+	}
+}
+
+func TestASlowAdGuardCannotHoldTheCardPastItsLimit(t *testing.T) {
+	a := newApp(t, owner.Sub)
+	approved(t, a, budi)
+	a.adguard.hold = true
+	began := time.Now()
+	status, card := a.card(t, "budi-card")
+	if time.Since(began) > 2*time.Second {
+		t.Fatalf("the card took %v", time.Since(began))
+	}
+	withinPawlsLimits(t, card)
+	if status != http.StatusOK || len(card.Fields) != 1 || card.Fields[0].Label != "Client ID" || !strings.Contains(card.Message, "AdGuard is not answering") {
+		t.Fatalf("card %d %#v", status, card)
 	}
 }
 

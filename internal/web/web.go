@@ -51,6 +51,8 @@ type Server struct {
 	Missing string
 	Log     func(format string, args ...any)
 	Now     func() time.Time
+
+	CardTimeout time.Duration
 }
 
 var notices = map[string]string{
@@ -448,6 +450,11 @@ func (s *Server) card(w http.ResponseWriter, r *http.Request) {
 	}
 	person, err := s.Pawl.Card(r.Context(), token)
 	if err != nil {
+		if why := pawl.Why(err); why != "" {
+			s.Log("card token refused: %s", why)
+		} else {
+			s.Log("card token not checked: %v", err)
+		}
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte(`{"error":"invalid_token"}`))
 		return
@@ -459,5 +466,11 @@ func (s *Server) card(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"error":"unavailable"}`))
 		return
 	}
-	json.NewEncoder(w).Encode(s.cardFor(account, s.addressesFor(r.Context(), account)))
+	read := r.Context()
+	if s.CardTimeout > 0 {
+		var cancel context.CancelFunc
+		read, cancel = context.WithTimeout(read, s.CardTimeout)
+		defer cancel()
+	}
+	json.NewEncoder(w).Encode(s.cardFor(account, s.addressesFor(read, account)))
 }

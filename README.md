@@ -68,14 +68,22 @@ the page.
 | `PAWL_CLIENT_ID`, `PAWL_CLIENT_SECRET` | from registering this app in Pawl |
 | `PUBLIC_ORIGIN` | this app's own address, e.g. `https://enroll.example.com` |
 | `ADMIN_SUBJECTS` | comma-separated Pawl subjects of the admins |
+| `SESSION_KEY` | optional, at least 32 characters; seals sessions so a new client secret does not sign everyone out |
+| `CARD_ADGUARD_TIMEOUT` | how long the card waits for AdGuard, default `4s` (Pawl gives the card 5 s) |
 | `DATA_DIR` | data directory, default `/data` |
 | `LISTEN` | listen address, default `:8080` |
 
 Without one of the four Pawl settings the app starts, answers `/healthz`, and
 every page says which one is missing. Without `ADMIN_SUBJECTS` nobody is admin,
 and the page shows the signed-in person their own subject to put there.
-Sessions are sealed with a key derived from the client secret, so a new secret
-signs everyone out.
+Without `SESSION_KEY`, sessions are sealed with a key derived from the client
+secret, so a new secret signs everyone out; the log says so at start-up. Setting
+`SESSION_KEY` later changes the key once, which signs everyone out one time.
+If AdGuard does not answer within `CARD_ADGUARD_TIMEOUT`, the card is still
+returned, without the address, and says AdGuard is not answering.
+A card token that Pawl's key does not accept is refused with a log line that
+names only the reason (for example `expired` or `wrong audience`), never the
+token.
 
 `ADMIN_EMAILS`, `ACCESS_TEAM`, `ACCESS_AUD` and, since 0.1.3, `DOH_HOST` are no
 longer read; the log says so, and why, when they are still set.
