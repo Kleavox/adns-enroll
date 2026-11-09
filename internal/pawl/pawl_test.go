@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -221,6 +222,54 @@ func TestACardRequestIsAcceptedOnlyAsACardRequest(t *testing.T) {
 		if _, err := p.Card(ctx, token); err == nil {
 			t.Errorf("%s was accepted", name)
 		}
+	}
+}
+
+func TestARefusedTokenSaysWhyAndStillIsDenied(t *testing.T) {
+	f := newFake(t)
+	p := provider(f)
+	use := map[string]any{"token_use": "pawl-card"}
+	with := func(extra map[string]any) string {
+		claims := f.claims(use)
+		for name, value := range extra {
+			claims[name] = value
+		}
+		return f.sign(t, claims, "k1")
+	}
+	stranger, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	other := newFake(t)
+	other.key = stranger
+	cases := map[string]struct {
+		token string
+		why   string
+	}{
+		"not a token":        {"a.b", "malformed"},
+		"unknown key":        {f.sign(t, f.claims(use), "k2"), "unknown key"},
+		"another signer":     {other.sign(t, other.claims(use), "k1"), "bad signature"},
+		"another issuer":     {with(map[string]any{"iss": "https://evil.test"}), "wrong issuer"},
+		"another app":        {with(map[string]any{"aud": "other"}), "wrong audience"},
+		"expired":            {with(map[string]any{"exp": now.Add(-2 * time.Minute).Unix()}), "expired"},
+		"from the future":    {with(map[string]any{"iat": now.Add(10 * time.Minute).Unix()}), "issued in the future"},
+		"no subject":         {with(map[string]any{"sub": ""}), "no subject"},
+		"an id token":        {f.sign(t, f.claims(map[string]any{"nonce": "n"}), "k1"), "not a card token"},
+		"no use":             {f.sign(t, f.claims(nil), "k1"), "not a card token"},
+		"an unsupported alg": {"eyJhbGciOiJIUzI1NiIsImtpZCI6ImsxIn0.e30.AAAA", "unsupported algorithm"},
+	}
+	for name, c := range cases {
+		_, err := p.Card(ctx, c.token)
+		if !errors.Is(err, ErrDenied) {
+			t.Errorf("%s: %v is not a denial", name, err)
+			continue
+		}
+		if got := Why(err); got != c.why {
+			t.Errorf("%s: reason %q, want %q", name, got, c.why)
+		}
+		if strings.Contains(err.Error(), c.token) {
+			t.Errorf("%s: the error carries the token", name)
+		}
+	}
+	if Why(errors.New("pawl answered 502")) != "" || Why(nil) != "" {
+		t.Error("only a refusal has a reason")
 	}
 }
 

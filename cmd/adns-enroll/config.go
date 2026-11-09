@@ -3,7 +3,14 @@ package main
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"fmt"
 	"strings"
+	"time"
+)
+
+const (
+	defaultCardTimeout = 4 * time.Second
+	minSessionKey      = 32
 )
 
 var retired = []struct{ name, why string }{
@@ -24,7 +31,10 @@ type config struct {
 	Origin          string
 	DataDir         string
 	Listen          string
+	SessionKey      string
+	CardTimeout     time.Duration
 	Retired         []string
+	Problems        []string
 }
 
 func load(getenv func(string) string) (config, []string) {
@@ -39,6 +49,18 @@ func load(getenv func(string) string) (config, []string) {
 		Origin:          strings.TrimSuffix(value("PUBLIC_ORIGIN"), "/"),
 		DataDir:         value("DATA_DIR"),
 		Listen:          value("LISTEN"),
+		SessionKey:      value("SESSION_KEY"),
+		CardTimeout:     defaultCardTimeout,
+	}
+	if c.SessionKey != "" && len(c.SessionKey) < minSessionKey {
+		c.Problems = append(c.Problems, fmt.Sprintf("SESSION_KEY is shorter than %d characters", minSessionKey))
+	}
+	if text := value("CARD_ADGUARD_TIMEOUT"); text != "" {
+		if limit, err := time.ParseDuration(text); err != nil || limit <= 0 {
+			c.Problems = append(c.Problems, "CARD_ADGUARD_TIMEOUT is not a positive duration such as 4s")
+		} else {
+			c.CardTimeout = limit
+		}
 	}
 	for admin := range strings.SplitSeq(getenv("ADMIN_SUBJECTS"), ",") {
 		if admin = strings.TrimSpace(admin); admin != "" {
@@ -89,7 +111,14 @@ func (c config) signInMissing() string {
 	return ""
 }
 
+func (c config) sessionTiedToSecret() bool { return c.SessionKey == "" }
+
 func (c config) sessionKey() []byte {
+	if c.SessionKey != "" {
+		signer := hmac.New(sha256.New, []byte(c.SessionKey))
+		signer.Write([]byte("adns-enroll session key"))
+		return signer.Sum(nil)
+	}
 	signer := hmac.New(sha256.New, []byte(c.ClientSecret))
 	signer.Write([]byte("adns-enroll session"))
 	return signer.Sum(nil)

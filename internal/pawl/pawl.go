@@ -30,6 +30,20 @@ const (
 
 var ErrDenied = errors.New("not signed by Pawl for this app")
 
+type Refusal struct{ Reason string }
+
+func (r Refusal) Error() string { return ErrDenied.Error() + ": " + r.Reason }
+
+func (r Refusal) Is(target error) bool { return target == ErrDenied }
+
+func Why(err error) string {
+	var refusal Refusal
+	if errors.As(err, &refusal) {
+		return refusal.Reason
+	}
+	return ""
+}
+
 type Person struct {
 	Sub   string
 	Email string
@@ -177,13 +191,13 @@ func (p *Provider) Exchange(ctx context.Context, code, verifier, nonce string) (
 	}
 	return p.verify(ctx, tokens.IDToken, func(c claims) bool {
 		return c.Use == "" && nonce != "" && c.Nonce == nonce
-	})
+	}, "not a sign-in token")
 }
 
 func (p *Provider) Card(ctx context.Context, token string) (Person, error) {
 	return p.verify(ctx, token, func(c claims) bool {
 		return c.Use == CardUse && c.Nonce == ""
-	})
+	}, "not a card token")
 }
 
 func (p *Provider) Live(ctx context.Context, subjects []string) ([]string, error) {
@@ -253,17 +267,20 @@ func decode(part string, into any) error {
 	return json.Unmarshal(raw, into)
 }
 
-func (p *Provider) verify(ctx context.Context, token string, meant func(claims) bool) (Person, error) {
+func (p *Provider) verify(ctx context.Context, token string, meant func(claims) bool, unmeant string) (Person, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return Person{}, ErrDenied
+		return Person{}, Refusal{"malformed"}
 	}
 	var header struct {
 		Alg string `json:"alg"`
 		Kid string `json:"kid"`
 	}
-	if decode(parts[0], &header) != nil || header.Alg != "ES256" || header.Kid == "" {
-		return Person{}, ErrDenied
+	if decode(parts[0], &header) != nil || header.Kid == "" {
+		return Person{}, Refusal{"malformed"}
+	}
+	if header.Alg != "ES256" {
+		return Person{}, Refusal{"unsupported algorithm"}
 	}
 	meta, err := p.discover(ctx)
 	if err != nil {
@@ -271,30 +288,35 @@ func (p *Provider) verify(ctx context.Context, token string, meant func(claims) 
 	}
 	key, err := p.key(ctx, meta, header.Kid)
 	if err != nil {
-		return Person{}, ErrDenied
+		return Person{}, Refusal{"unknown key"}
 	}
 	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil || len(signature) != 64 {
-		return Person{}, ErrDenied
+		return Person{}, Refusal{"bad signature"}
 	}
 	sum := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
 	r, s := new(big.Int).SetBytes(signature[:32]), new(big.Int).SetBytes(signature[32:])
 	if !ecdsa.Verify(key, sum[:], r, s) {
-		return Person{}, ErrDenied
+		return Person{}, Refusal{"bad signature"}
 	}
 	var c claims
 	if decode(parts[1], &c) != nil {
-		return Person{}, ErrDenied
+		return Person{}, Refusal{"malformed"}
 	}
 	now := p.Now()
 	switch {
-	case c.Issuer != meta.Issuer,
-		!slices.Contains(c.Audience, p.ClientID),
-		strings.TrimSpace(c.Subject) == "",
-		c.Expires == nil || now.After(time.Unix(*c.Expires, 0).Add(leeway)),
-		c.Issued != nil && now.Add(leeway).Before(time.Unix(*c.Issued, 0)),
-		!meant(c):
-		return Person{}, ErrDenied
+	case c.Issuer != meta.Issuer:
+		return Person{}, Refusal{"wrong issuer"}
+	case !slices.Contains(c.Audience, p.ClientID):
+		return Person{}, Refusal{"wrong audience"}
+	case strings.TrimSpace(c.Subject) == "":
+		return Person{}, Refusal{"no subject"}
+	case c.Expires == nil || now.After(time.Unix(*c.Expires, 0).Add(leeway)):
+		return Person{}, Refusal{"expired"}
+	case c.Issued != nil && now.Add(leeway).Before(time.Unix(*c.Issued, 0)):
+		return Person{}, Refusal{"issued in the future"}
+	case !meant(c):
+		return Person{}, Refusal{unmeant}
 	}
 	person := Person{Sub: c.Subject, Name: strings.TrimSpace(c.Name)}
 	if c.Verified {
